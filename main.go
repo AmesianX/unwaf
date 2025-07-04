@@ -35,7 +35,6 @@ const usage = `
 Author:
   Name:               Martín Martín
   LinkedIn:           https://www.linkedin.com/in/martinmarting/
-  Twitter/X:          https://x.com/mmrecon
   GitHub:             https://github.com/mmarting/unwaf
 
 Usage:
