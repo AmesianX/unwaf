@@ -1,5 +1,5 @@
 
-# Unwaf v2.0
+# unwaf
 
 Unwaf is a Go tool designed to help identify WAF bypasses using **passive techniques**. It automates the process of discovering the real origin IP behind a WAF/CDN by combining multiple discovery methods and verifying candidates through HTML similarity comparison.
 
