@@ -8,7 +8,7 @@ Unwaf is automating the steps I explained on this LinkedIn Post: [Passive WAF by
 ## What's new in v2.0
 
 - **4 new free discovery methods** — MX records, subdomain probing (30+ common names), Certificate Transparency (crt.sh), WAF fingerprinting
-- **Censys SSL certificate search** — finds hosts presenting certs matching the domain (optional, API key)
+- **Censys SSL certificate search** — finds hosts presenting certs matching the domain. Supports the new Platform API v3 (Bearer token) and legacy v2 (BasicAuth) with automatic detection.
 - **WAF confirmation** — resolves the domain's A records and checks if they belong to known WAF/CDN ranges before scanning, avoiding false positives on unprotected domains
 - **WAF fingerprinting** — identifies Cloudflare, Akamai, AWS CloudFront, Fastly, Sucuri, Imperva, and more via HTTP headers
 - **Favicon hashing** — generates MD5/SHA256 hashes for manual Shodan/Censys lookups
@@ -34,7 +34,7 @@ Unwaf is automating the steps I explained on this LinkedIn Post: [Passive WAF by
 | Favicon hashing | Free | Generates hashes for manual Shodan/Censys favicon search |
 | ViewDNS history | API key | Historical DNS A records |
 | SecurityTrails history | API key | Historical DNS A records |
-| Censys SSL search | API key | Finds hosts presenting SSL certs matching the domain |
+| Censys SSL search | API key | Finds hosts presenting SSL certs matching the domain (v3 Platform API + v2 fallback) |
 
 ## Installation
 
@@ -130,7 +130,12 @@ viewdns=""
 # SecurityTrails — DNS history (https://securitytrails.com/corp/api)
 securitytrails=""
 
-# Censys — SSL certificate search (https://search.censys.io/account/api)
+# Censys — SSL certificate search (https://docs.censys.com/reference/get-started)
+# Option 1: New Platform API (recommended, works with all accounts)
+#   Get your token + org ID from: https://app.censys.io/account/api
+censys_token=""
+censys_org_id=""
+# Option 2: Legacy Search API v2 (deprecated, may not work with new accounts)
 censys_id=""
 censys_secret=""
 ```
