@@ -132,8 +132,9 @@ securitytrails=""
 
 # Censys — SSL certificate search (https://docs.censys.com/reference/get-started)
 # Option 1: New Platform API (recommended, works with all accounts)
-#   Get your token + org ID from: https://app.censys.io/account/api
+#   Get your PAT from: https://app.censys.io/account/api
 censys_token=""
+#   Org ID is optional (only needed for paid/org accounts, visible in Platform URL)
 censys_org_id=""
 # Option 2: Legacy Search API v2 (deprecated, may not work with new accounts)
 censys_id=""

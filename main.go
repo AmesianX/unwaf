@@ -246,8 +246,9 @@ securitytrails=""
 
 # Censys — SSL certificate search (https://docs.censys.com/reference/get-started)
 # Option 1: New Platform API (recommended, works with all accounts)
-#   Get your token + org ID from: https://app.censys.io/account/api
+#   Get your PAT from: https://app.censys.io/account/api
 censys_token=""
+#   Org ID is optional (only needed for paid/org accounts, visible in Platform URL)
 censys_org_id=""
 # Option 2: Legacy Search API v2 (deprecated, may not work with new accounts)
 censys_id=""
@@ -835,7 +836,11 @@ func fetchIPsFromCensysV3(domain, token, orgID string) ([]string, error) {
 	var ips []string
 
 	// Search for hosts presenting certificates matching the domain
-	searchURL := fmt.Sprintf("https://api.platform.censys.io/v3/global/search/query?organization_id=%s", orgID)
+	// org_id is optional for free accounts, required for paid/org accounts
+	searchURL := "https://api.platform.censys.io/v3/global/search/query"
+	if orgID != "" {
+		searchURL += "?organization_id=" + orgID
+	}
 
 	query := fmt.Sprintf("cert.names: %s", domain)
 	bodyData := fmt.Sprintf(`{"query":"%s","page_size":50}`, query)
@@ -847,6 +852,9 @@ func fetchIPsFromCensysV3(domain, token, orgID string) ([]string, error) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	if orgID != "" {
+		req.Header.Set("X-Organization-ID", orgID)
+	}
 
 	resp, err := defaultClient.Do(req)
 	if err != nil {
@@ -856,14 +864,20 @@ func fetchIPsFromCensysV3(domain, token, orgID string) ([]string, error) {
 
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("Censys Platform API returned status %d: %s", resp.StatusCode, string(body)[:min(200, len(body))])
+		hint := ""
+		if resp.StatusCode == 403 {
+			hint = " (ensure your user has the 'API Access' role in Censys Platform Settings > Members)"
+		}
+		if resp.StatusCode == 401 {
+			hint = " (check your PAT is valid at https://app.censys.io/account/api)"
+		}
+		return nil, fmt.Errorf("Censys Platform API returned status %d%s: %s", resp.StatusCode, hint, truncateStr(string(body), 200))
 	}
 
 	var searchResult struct {
 		Result struct {
 			Hits []struct {
-				IP    string `json:"ip"`
-				Names []string `json:"cert.names"`
+				IP       string `json:"ip"`
 				Services []struct {
 					IP string `json:"ip"`
 				} `json:"services"`
@@ -887,6 +901,13 @@ func fetchIPsFromCensysV3(domain, token, orgID string) ([]string, error) {
 	}
 
 	return ips, nil
+}
+
+func truncateStr(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
 }
 
 // fetchIPsFromCensysV2 uses the legacy Search API v2 (BasicAuth, deprecated)
@@ -968,8 +989,8 @@ func fetchIPsFromCensysV2(domain, apiID, apiSecret string) ([]string, error) {
 
 // fetchIPsFromCensys tries v3 first, falls back to v2
 func fetchIPsFromCensys(domain string, config *Config) ([]string, error) {
-	// Prefer v3 Platform API
-	if config.CensysToken != "" && config.CensysOrgID != "" {
+	// Prefer v3 Platform API (only token required, org_id optional)
+	if config.CensysToken != "" {
 		logVerbose(true, "Using Censys Platform API v3 (Bearer token)")
 		return fetchIPsFromCensysV3(domain, config.CensysToken, config.CensysOrgID)
 	}
@@ -1263,7 +1284,7 @@ func processDomain(domain, source, configPath string, threshold float64, workers
 	if !silent {
 		boldWhite.Println("  [7/7] Censys SSL Certificate Search")
 	}
-	hasCensysV3 := config.CensysToken != "" && config.CensysOrgID != ""
+	hasCensysV3 := config.CensysToken != ""
 	hasCensysV2 := config.CensysID != "" && config.CensysSecret != ""
 	if hasCensysV3 || hasCensysV2 {
 		censysIPs, err := fetchIPsFromCensys(mainDomain, config)
@@ -1274,8 +1295,8 @@ func processDomain(domain, source, configPath string, threshold float64, workers
 			addIPs("Censys", censysIPs)
 		}
 	} else if !silent {
-		dimWhite.Println("    Skipped — no API keys. Add censys_token + censys_org_id to config.")
-		dimWhite.Println("    Get yours at: https://app.censys.io/account/api")
+		dimWhite.Println("    Skipped — no API key. Add censys_token to config.")
+		dimWhite.Println("    Get your PAT at: https://app.censys.io/account/api")
 	}
 
 	// Filter and deduplicate
