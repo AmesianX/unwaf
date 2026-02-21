@@ -2,1382 +2,25 @@ package main
 
 import (
 	"bufio"
-	"crypto/md5"
-	"crypto/sha256"
-	"crypto/tls"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
-	"github.com/fatih/color"
-	"github.com/sergi/go-diff/diffmatchpatch"
-	"golang.org/x/net/html"
-	"golang.org/x/net/html/charset"
+	"golang.org/x/time/rate"
 )
 
-const version = "2.0.0"
-
-const logo = `
-░▒▓█▓▒░░▒▓█▓▒░▒▓███████▓▒░░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░░▒▓██████▓▒░░▒▓████████▓▒░ 
-░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░        
-░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░        
-░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓████████▓▒░▒▓██████▓▒░   
-░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░        
-░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░        
- ░▒▓██████▓▒░░▒▓█▓▒░░▒▓█▓▒░░▒▓█████████████▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░        
-                                                                     `
-
-const usage = `
-Author:
-  Name:               Martín Martín
-  Website:            https://mmartin.me/
-  LinkedIn:           https://www.linkedin.com/in/martinmarting/
-  GitHub:             https://github.com/mmarting/unwaf
-
-Usage:
-  -d, --domain        The domain to check (required)
-  -s, --source        The source HTML file to compare (optional)
-  -c, --config        The config file path (optional, default: $HOME/.unwaf.conf)
-  -t, --threshold     Similarity threshold percentage (optional, default: 60)
-  -w, --workers       Number of concurrent workers (optional, default: 50)
-  -v, --verbose       Enable verbose output
-  -q, --quiet         Silent mode: only output bypass IPs (for piping/automation)
-  -h, --help          Display help information
-
-Examples:
-  1. Check a domain:
-     unwaf -d example.com
-
-  2. Check a domain with a manually provided HTML file:
-     unwaf -d example.com -s original.html
-
-  3. Check a domain with a custom location for the config file:
-     unwaf -d example.com -c /path/to/config
-
-  4. Check a domain with a lower similarity threshold:
-     unwaf -d example.com -t 40
-
-  5. Check with more concurrent workers:
-     unwaf -d example.com -w 100
-
-Discovery methods:
-  [FREE]    SPF records (ip4/ip6 mechanisms)
-  [FREE]    MX records (mail server IPs)
-  [FREE]    Common mail/origin subdomains (DNS resolution)
-  [FREE]    Certificate Transparency logs (crt.sh)
-  [FREE]    WAF detection (fingerprinting)
-  [FREE]    Favicon hash fingerprinting (for manual Shodan/Censys search)
-  [API]     ViewDNS IP history
-  [API]     SecurityTrails DNS history
-  [API]     Censys SSL certificate search (paid license required)
-
-Note:
-  API-based methods require keys in the config file: $HOME/.unwaf.conf.
-  The tool will create an example config file after first execution.
-  Censys requires a paid license with an Organization ID for API access.
-`
-
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
-
-type Config struct {
-	ViewDNS        string `json:"viewdns"`
-	SecurityTrails string `json:"securitytrails"`
-	CensysToken    string `json:"censys_token"`  // Platform API PAT (paid license required)
-	CensysOrgID    string `json:"censys_org_id"` // Platform Org ID (required)
-}
-
-var apiKeyRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
-
-// Known WAF/CDN IP ranges (CIDR prefixes) to filter out
-var wafCIDRs = []string{
-	// Cloudflare
-	"103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
-	"104.16.0.0/13", "104.24.0.0/14", "108.162.192.0/18",
-	"131.0.72.0/22", "141.101.64.0/18", "162.158.0.0/15",
-	"172.64.0.0/13", "173.245.48.0/20", "188.114.96.0/20",
-	"190.93.240.0/20", "197.234.240.0/22", "198.41.128.0/17",
-	// Akamai (common ranges)
-	"23.0.0.0/12", "104.64.0.0/10",
-	// Fastly
-	"151.101.0.0/16",
-	// Imperva / Incapsula
-	"199.83.128.0/21", "198.143.32.0/19",
-	// Sucuri
-	"192.88.134.0/23", "185.93.228.0/22",
-	// AWS CloudFront (common)
-	"13.32.0.0/15", "13.35.0.0/16", "13.224.0.0/14",
-	"18.64.0.0/14", "18.154.0.0/15", "18.160.0.0/12",
-	"52.84.0.0/15", "54.182.0.0/16", "54.192.0.0/16",
-	"54.230.0.0/17", "54.239.128.0/18", "99.84.0.0/16",
-	"143.204.0.0/16", "205.251.192.0/19", "204.246.164.0/22",
-}
-
-// Known WAF signatures in HTTP response headers
-var wafSignatures = map[string][]string{
-	"Cloudflare":        {"cf-ray", "cf-cache-status", "cf-request-id"},
-	"Akamai":            {"x-akamai-transformed", "akamai-origin-hop"},
-	"AWS CloudFront":    {"x-amz-cf-id", "x-amz-cf-pop"},
-	"Fastly":            {"x-fastly-request-id", "fastly-io-info"},
-	"Sucuri":            {"x-sucuri-id", "x-sucuri-cache"},
-	"Imperva/Incapsula": {"x-iinfo", "x-cdn"},
-	"Varnish":           {"x-varnish"},
-	"StackPath":         {"x-sp-url", "x-sp-waf"},
-	"Barracuda":         {"barra_counter_session"},
-	"F5 BIG-IP":         {"x-wa-info", "x-cnection"},
-	"DDoS-Guard":        {"ddos-guard"},
-	"ArvanCloud":        {"ar-asg", "ar-poweredby"},
-}
-
-// Subdomains commonly pointing to origin (not behind WAF)
-var originSubdomains = []string{
-	"mail", "webmail", "smtp", "pop", "imap",
-	"ftp", "sftp",
-	"cpanel", "whm", "plesk", "webmin",
-	"direct", "origin", "origin-www", "direct-connect",
-	"dev", "staging", "stage", "test", "qa", "uat",
-	"api", "backend", "admin", "panel",
-	"old", "legacy", "backup", "bak",
-	"ns1", "ns2", "dns",
-	"vpn", "remote", "gateway",
-	"mx", "mx1", "mx2", "mailgw",
-	"autodiscover", "autoconfig",
-	"portal", "intranet", "internal",
-}
-
-// Ports to check for web servers
-var webPorts = []int{80, 443, 8080, 8443, 8000, 8008, 8888, 9443}
-
-// ---------------------------------------------------------------------------
-// Display helpers
-// ---------------------------------------------------------------------------
-
-var (
-	boldGreen  = color.New(color.Bold, color.FgGreen)
-	boldRed    = color.New(color.Bold, color.FgRed)
-	boldYellow = color.New(color.Bold, color.FgYellow)
-	boldCyan   = color.New(color.Bold, color.FgCyan)
-	boldWhite  = color.New(color.Bold, color.FgWhite)
-	dimWhite   = color.New(color.Faint)
-)
-
-var silent bool
-
-func showUsage() {
-	fmt.Println(logo)
-	fmt.Println(usage)
-}
-
-func sectionHeader(title string) {
-	if silent {
-		return
-	}
-	padLen := 60 - len(title)
-	if padLen < 0 {
-		padLen = 0
-	}
-	fmt.Println()
-	boldCyan.Printf("── %s %s", title, strings.Repeat("─", padLen))
-	fmt.Println()
-}
-
-func logInfo(format string, a ...interface{}) {
-	if silent {
-		return
-	}
-	fmt.Printf("  "+format+"\n", a...)
-}
-
-func logFound(format string, a ...interface{}) {
-	if silent {
-		return
-	}
-	boldGreen.Printf("  ✓ "+format+"\n", a...)
-}
-
-func logWarn(format string, a ...interface{}) {
-	if silent {
-		return
-	}
-	boldYellow.Printf("  ⚠ "+format+"\n", a...)
-}
-
-func logError(format string, a ...interface{}) {
-	if silent {
-		return
-	}
-	boldRed.Printf("  ✗ "+format+"\n", a...)
-}
-
-func logVerbose(verbose bool, format string, a ...interface{}) {
-	if silent {
-		return
-	}
-	if verbose {
-		dimWhite.Printf("    "+format+"\n", a...)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Config management
-// ---------------------------------------------------------------------------
-
-func createDefaultConfig(configPath string) error {
-	defaultConfig := `# Unwaf config file — API keys for optional discovery methods
-# Free methods (SPF, MX, crt.sh, subdomains) work without any keys.
-
-# ViewDNS.info — DNS history (https://viewdns.info/api/)
-viewdns=""
-
-# SecurityTrails — DNS history (https://securitytrails.com/corp/api)
-securitytrails=""
-
-# Censys — SSL certificate search (requires a PAID license)
-#   API access is only available with a paid Censys account that has an Organization ID.
-#   Free accounts cannot use the API — see https://docs.censys.com/reference/get-started
-#   Get your PAT from: https://app.censys.io/account/api
-censys_token=""
-#   Org ID (required) — visible in your Censys Platform URL or Settings > Organization
-censys_org_id=""
-`
-	return os.WriteFile(configPath, []byte(defaultConfig), 0600)
-}
-
-func loadConfig(configPath string) (*Config, error) {
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		if err := createDefaultConfig(configPath); err != nil {
-			return nil, err
-		}
-	}
-
-	file, err := os.Open(configPath)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	config := &Config{}
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		key := strings.TrimSpace(parts[0])
-		value := strings.Trim(strings.TrimSpace(parts[1]), `"`)
-		if value == "" || !apiKeyRegex.MatchString(value) {
-			continue
-		}
-		switch key {
-		case "viewdns":
-			config.ViewDNS = value
-		case "securitytrails":
-			config.SecurityTrails = value
-		case "censys_token":
-			config.CensysToken = value
-		case "censys_org_id":
-			config.CensysOrgID = value
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	return config, nil
-}
-
-// ---------------------------------------------------------------------------
-// Domain/IP helpers
-// ---------------------------------------------------------------------------
-
-func extractMainDomain(domain string) string {
-	parts := strings.Split(domain, ".")
-	if len(parts) > 2 {
-		return strings.Join(parts[len(parts)-2:], ".")
-	}
-	return domain
-}
-
-// sanitizeDomain strips scheme, port, path, trailing slashes from user input
-// so both "example.com" and "https://www.example.com/path" work.
-func sanitizeDomain(input string) string {
-	d := strings.TrimSpace(input)
-	// Strip scheme
-	d = strings.TrimPrefix(d, "https://")
-	d = strings.TrimPrefix(d, "http://")
-	// Strip path and query
-	if idx := strings.IndexAny(d, "/?#"); idx != -1 {
-		d = d[:idx]
-	}
-	// Strip port
-	if host, _, err := net.SplitHostPort(d); err == nil {
-		d = host
-	}
-	// Strip trailing dots and slashes
-	d = strings.TrimRight(d, "./")
-	return d
-}
-
-func isWAFIP(ip string) bool {
-	parsedIP := net.ParseIP(ip)
-	if parsedIP == nil {
-		return false
-	}
-	for _, cidr := range wafCIDRs {
-		_, network, err := net.ParseCIDR(cidr)
-		if err != nil {
-			continue
-		}
-		if network.Contains(parsedIP) {
-			return true
-		}
-	}
-	return false
-}
-
-func isPrivateIP(ip string) bool {
-	parsedIP := net.ParseIP(ip)
-	if parsedIP == nil {
-		return false
-	}
-	privateRanges := []string{
-		"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-		"127.0.0.0/8", "169.254.0.0/16",
-	}
-	for _, cidr := range privateRanges {
-		_, network, _ := net.ParseCIDR(cidr)
-		if network.Contains(parsedIP) {
-			return true
-		}
-	}
-	return false
-}
-
-func expandIPRange(cidr string) ([]string, error) {
-	var ips []string
-	ip, ipnet, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return nil, err
-	}
-
-	// Skip ranges larger than /24 to avoid scanning too many IPs
-	ones, bits := ipnet.Mask.Size()
-	if bits-ones > 8 {
-		return nil, fmt.Errorf("CIDR range /%d too large, skipping (max /24)", ones)
-	}
-
-	for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); inc(ip) {
-		ips = append(ips, ip.String())
-	}
-
-	if len(ips) <= 2 {
-		return ips, nil
-	}
-	return ips[1 : len(ips)-1], nil
-}
-
-func inc(ip net.IP) {
-	for j := len(ip) - 1; j >= 0; j-- {
-		ip[j]++
-		if ip[j] > 0 {
-			break
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// HTTP client
-// ---------------------------------------------------------------------------
-
-func newHTTPClient(timeout time.Duration) *http.Client {
-	return &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     30 * time.Second,
-			DisableKeepAlives:   false,
-		},
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 3 {
-				return http.ErrUseLastResponse
-			}
-			return nil
-		},
-	}
-}
-
-var defaultClient = newHTTPClient(10 * time.Second)
-
-func fetchHTML(url string) (string, int, error) {
-	return fetchHTMLWithHost(url, "")
-}
-
-func fetchHTMLWithHost(url, host string) (string, int, error) {
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return "", 0, err
-	}
-
-	if host != "" {
-		req.Host = host
-	}
-
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Connection", "keep-alive")
-
-	resp, err := defaultClient.Do(req)
-	if err != nil {
-		return "", 0, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 500 {
-		return "", resp.StatusCode, fmt.Errorf("server error: %d", resp.StatusCode)
-	}
-
-	reader, err := charset.NewReader(resp.Body, resp.Header.Get("Content-Type"))
-	if err != nil {
-		return "", resp.StatusCode, err
-	}
-	z := html.NewTokenizer(reader)
-	var b strings.Builder
-	for {
-		tt := z.Next()
-		if tt == html.ErrorToken {
-			break
-		}
-		token := z.Token()
-		if token.Type == html.TextToken {
-			b.WriteString(token.Data)
-		}
-	}
-	return b.String(), resp.StatusCode, nil
-}
-
-func fetchRawBytes(url string) ([]byte, int, error) {
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, 0, err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0")
-	resp, err := defaultClient.Do(req)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, resp.StatusCode, err
-	}
-	return body, resp.StatusCode, nil
-}
-
-// ---------------------------------------------------------------------------
-// WAF detection
-// ---------------------------------------------------------------------------
-
-func detectWAF(domain string) string {
-	urls := []string{
-		"https://" + domain,
-		"http://" + domain,
-	}
-
-	for _, url := range urls {
-		req, err := http.NewRequest("GET", url, nil)
-		if err != nil {
-			continue
-		}
-		req.Header.Set("User-Agent", "Mozilla/5.0")
-
-		resp, err := defaultClient.Do(req)
-		if err != nil {
-			continue
-		}
-		resp.Body.Close()
-
-		// Check headers
-		for waf, headers := range wafSignatures {
-			for _, header := range headers {
-				if resp.Header.Get(header) != "" {
-					return waf
-				}
-			}
-		}
-
-		// Check Server header
-		server := strings.ToLower(resp.Header.Get("Server"))
-		if strings.Contains(server, "cloudflare") {
-			return "Cloudflare"
-		}
-		if strings.Contains(server, "akamaighost") || strings.Contains(server, "akamai") {
-			return "Akamai"
-		}
-		if strings.Contains(server, "sucuri") {
-			return "Sucuri"
-		}
-		if strings.Contains(server, "incapsula") || strings.Contains(server, "imperva") {
-			return "Imperva/Incapsula"
-		}
-		if strings.Contains(server, "ddos-guard") {
-			return "DDoS-Guard"
-		}
-	}
-	return "Unknown"
-}
-
-// ---------------------------------------------------------------------------
-// Favicon hash (for manual Shodan/Censys lookup)
-// ---------------------------------------------------------------------------
-
-func getFaviconHashes(domain string) (string, string) {
-	urls := []string{
-		"https://" + domain + "/favicon.ico",
-		"http://" + domain + "/favicon.ico",
-	}
-
-	for _, url := range urls {
-		body, statusCode, err := fetchRawBytes(url)
-		if err != nil || statusCode != 200 || len(body) == 0 {
-			continue
-		}
-		md5Hash := fmt.Sprintf("%x", md5.Sum(body))
-		sha256Hash := fmt.Sprintf("%x", sha256.Sum256(body))
-		return md5Hash, sha256Hash
-	}
-	return "", ""
-}
-
-// ---------------------------------------------------------------------------
-// Discovery: SPF records
-// ---------------------------------------------------------------------------
-
-func extractIPsFromSPF(domain string) ([]string, error) {
-	var ips []string
-	txtRecords, err := net.LookupTXT(domain)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, txt := range txtRecords {
-		if strings.HasPrefix(txt, "v=spf1") {
-			parts := strings.Fields(txt)
-			for _, part := range parts {
-				if strings.HasPrefix(part, "ip4:") {
-					ip := strings.TrimPrefix(part, "ip4:")
-					if strings.Contains(ip, "/") {
-						rangedIps, err := expandIPRange(ip)
-						if err != nil {
-							continue
-						}
-						ips = append(ips, rangedIps...)
-					} else {
-						ips = append(ips, ip)
-					}
-				} else if strings.HasPrefix(part, "ip6:") {
-					ip := strings.TrimPrefix(part, "ip6:")
-					ips = append(ips, ip)
-				}
-			}
-		}
-	}
-	return ips, nil
-}
-
-// ---------------------------------------------------------------------------
-// Discovery: MX records
-// ---------------------------------------------------------------------------
-
-func extractIPsFromMX(domain string) ([]string, error) {
-	var ips []string
-	mxRecords, err := net.LookupMX(domain)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, mx := range mxRecords {
-		host := strings.TrimSuffix(mx.Host, ".")
-		// Skip third-party mail services
-		lowerHost := strings.ToLower(host)
-		if strings.Contains(lowerHost, "google") ||
-			strings.Contains(lowerHost, "outlook") ||
-			strings.Contains(lowerHost, "microsoft") ||
-			strings.Contains(lowerHost, "mimecast") ||
-			strings.Contains(lowerHost, "proofpoint") ||
-			strings.Contains(lowerHost, "barracuda") ||
-			strings.Contains(lowerHost, "pphosted") {
-			continue
-		}
-
-		addrs, err := net.LookupHost(host)
-		if err != nil {
-			continue
-		}
-		ips = append(ips, addrs...)
-	}
-	return ips, nil
-}
-
-// ---------------------------------------------------------------------------
-// Discovery: Common subdomains
-// ---------------------------------------------------------------------------
-
-func extractIPsFromSubdomains(domain string, verbose bool) []string {
-	var ips []string
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-
-	for _, sub := range originSubdomains {
-		wg.Add(1)
-		go func(subdomain string) {
-			defer wg.Done()
-			fqdn := subdomain + "." + domain
-			addrs, err := net.LookupHost(fqdn)
-			if err != nil {
-				return
-			}
-			mu.Lock()
-			for _, addr := range addrs {
-				if !isWAFIP(addr) && !isPrivateIP(addr) {
-					ips = append(ips, addr)
-					logVerbose(verbose, "Subdomain %s → %s", fqdn, addr)
-				}
-			}
-			mu.Unlock()
-		}(sub)
-	}
-	wg.Wait()
-	return ips
-}
-
-// ---------------------------------------------------------------------------
-// Discovery: Certificate Transparency (crt.sh)
-// ---------------------------------------------------------------------------
-
-type CrtShEntry struct {
-	NameValue string `json:"name_value"`
-}
-
-func extractIPsFromCrtSh(domain string, verbose bool) ([]string, error) {
-	url := fmt.Sprintf("https://crt.sh/?q=%%25.%s&output=json", domain)
-
-	client := newHTTPClient(30 * time.Second)
-	resp, err := client.Get(url)
-	if err != nil {
-		return nil, fmt.Errorf("crt.sh request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("crt.sh returned status %d", resp.StatusCode)
-	}
-
-	var entries []CrtShEntry
-	if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
-		return nil, fmt.Errorf("failed to parse crt.sh response: %w", err)
-	}
-
-	// Extract unique subdomain names
-	subdomainSet := make(map[string]bool)
-	for _, entry := range entries {
-		names := strings.Split(entry.NameValue, "\n")
-		for _, name := range names {
-			name = strings.TrimSpace(name)
-			name = strings.TrimPrefix(name, "*.")
-			if name != "" && !subdomainSet[name] {
-				subdomainSet[name] = true
-			}
-		}
-	}
-
-	logInfo("Found %d unique subdomains in CT logs.", len(subdomainSet))
-
-	// Resolve subdomains to IPs, filtering WAF IPs
-	var ips []string
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 20) // limit concurrent DNS lookups
-
-	for subdomain := range subdomainSet {
-		wg.Add(1)
-		go func(sub string) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			addrs, err := net.LookupHost(sub)
-			if err != nil {
-				return
-			}
-			mu.Lock()
-			for _, addr := range addrs {
-				if !isWAFIP(addr) && !isPrivateIP(addr) {
-					ips = append(ips, addr)
-					logVerbose(verbose, "CT subdomain %s → %s", sub, addr)
-				}
-			}
-			mu.Unlock()
-		}(subdomain)
-	}
-	wg.Wait()
-	return ips, nil
-}
-
-// ---------------------------------------------------------------------------
-// Discovery: ViewDNS
-// ---------------------------------------------------------------------------
-
-func fetchIPsFromViewDNS(domain, apiKey string) ([]string, error) {
-	var ips []string
-	url := fmt.Sprintf("https://api.viewdns.info/iphistory/?domain=%s&apikey=%s&output=json", domain, apiKey)
-	resp, err := defaultClient.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("received non-200 response code: %d", resp.StatusCode)
-	}
-
-	var result struct {
-		Query    map[string]string `json:"query"`
-		Response struct {
-			Records []struct {
-				IP string `json:"ip"`
-			} `json:"records"`
-		} `json:"response"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
-	}
-
-	for _, record := range result.Response.Records {
-		ips = append(ips, record.IP)
-	}
-	return ips, nil
-}
-
-// ---------------------------------------------------------------------------
-// Discovery: SecurityTrails
-// ---------------------------------------------------------------------------
-
-func fetchIPsFromSecurityTrails(domain, apiKey string) ([]string, error) {
-	var ips []string
-	url := fmt.Sprintf("https://api.securitytrails.com/v1/history/%s/dns/a", domain)
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("APIKEY", apiKey)
-
-	resp, err := defaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("received non-200 response code: %d", resp.StatusCode)
-	}
-
-	var result struct {
-		Records []struct {
-			Values []struct {
-				IP string `json:"ip"`
-			} `json:"values"`
-		} `json:"records"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
-	}
-
-	for _, record := range result.Records {
-		for _, value := range record.Values {
-			ips = append(ips, value.IP)
-		}
-	}
-	return ips, nil
-}
-
-// ---------------------------------------------------------------------------
-// Discovery: Censys SSL certificate search
-// ---------------------------------------------------------------------------
-
-// fetchIPsFromCensys uses the Censys Platform API v3 (Bearer token auth).
-// Requires a paid Censys license with an Organization ID.
-func fetchIPsFromCensys(domain, token, orgID string) ([]string, error) {
-	var ips []string
-
-	searchURL := "https://api.platform.censys.io/v3/global/search/query"
-	if orgID != "" {
-		searchURL += "?organization_id=" + orgID
-	}
-
-	query := fmt.Sprintf("cert.names: %s", domain)
-	bodyData := fmt.Sprintf(`{"query":"%s","page_size":50}`, query)
-
-	req, err := http.NewRequest("POST", searchURL, strings.NewReader(bodyData))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	if orgID != "" {
-		req.Header.Set("X-Organization-ID", orgID)
-	}
-
-	resp, err := defaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		hint := ""
-		if resp.StatusCode == 403 {
-			hint = " (Censys API requires a paid license with an Organization ID — free accounts cannot use the API)"
-		}
-		if resp.StatusCode == 401 {
-			hint = " (check your PAT is valid at https://app.censys.io/account/api)"
-		}
-		return nil, fmt.Errorf("Censys Platform API returned status %d%s: %s", resp.StatusCode, hint, truncateStr(string(body), 200))
-	}
-
-	var searchResult struct {
-		Result struct {
-			Hits []struct {
-				IP       string `json:"ip"`
-				Services []struct {
-					IP string `json:"ip"`
-				} `json:"services"`
-			} `json:"hits"`
-		} `json:"result"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&searchResult); err != nil {
-		return nil, fmt.Errorf("failed to parse Censys response: %v", err)
-	}
-
-	for _, hit := range searchResult.Result.Hits {
-		if hit.IP != "" && !isWAFIP(hit.IP) {
-			ips = append(ips, hit.IP)
-		}
-		for _, svc := range hit.Services {
-			if svc.IP != "" && !isWAFIP(svc.IP) {
-				ips = append(ips, svc.IP)
-			}
-		}
-	}
-
-	return ips, nil
-}
-
-func truncateStr(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "..."
-}
-
-// ---------------------------------------------------------------------------
-// Port scanning & web server detection
-// ---------------------------------------------------------------------------
-
-func isPortOpen(ip string, port int) bool {
-	timeout := 2 * time.Second
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, port), timeout)
-	if err != nil {
-		return false
-	}
-	conn.Close()
-	return true
-}
-
-type webServerResult struct {
-	IP    string
-	Ports []int
-}
-
-func checkWebServer(ip string, wg *sync.WaitGroup, mu *sync.Mutex, results *[]webServerResult, runningCounter *int, checkedCounter *int, total int) {
-	defer wg.Done()
-	var openPorts []int
-	for _, port := range webPorts {
-		if isPortOpen(ip, port) {
-			openPorts = append(openPorts, port)
-		}
-	}
-
-	mu.Lock()
-	(*checkedCounter)++
-	if len(openPorts) > 0 {
-		*results = append(*results, webServerResult{IP: ip, Ports: openPorts})
-		(*runningCounter)++
-	}
-	if !silent {
-		fmt.Printf("\r  Scanning: %d/%d IPs with web server (%d checked, %.1f%%)",
-			*runningCounter, total, *checkedCounter, float64(*checkedCounter)/float64(total)*100)
-	}
-	mu.Unlock()
-}
-
-// ---------------------------------------------------------------------------
-// HTML comparison
-// ---------------------------------------------------------------------------
-
-func compareHTML(original, fetched string) float64 {
-	dmp := diffmatchpatch.New()
-	diffs := dmp.DiffMain(original, fetched, false)
-	similarity := 0
-	for _, diff := range diffs {
-		if diff.Type == diffmatchpatch.DiffEqual {
-			similarity += len(diff.Text)
-		}
-	}
-	totalLength := len(original) + len(fetched)
-	if totalLength == 0 {
-		return 1.0
-	}
-	return float64(similarity*2) / float64(totalLength)
-}
-
-// ---------------------------------------------------------------------------
-// Unique helper
-// ---------------------------------------------------------------------------
-
-func unique(items []string) []string {
-	seen := make(map[string]bool)
-	result := []string{}
-	for _, item := range items {
-		normalized := strings.TrimSpace(item)
-		if normalized == "" {
-			continue
-		}
-		if _, exists := seen[normalized]; !exists {
-			seen[normalized] = true
-			result = append(result, normalized)
-		}
-	}
-	return result
-}
-
-// ---------------------------------------------------------------------------
-// Results
-// ---------------------------------------------------------------------------
-
-type BypassResult struct {
-	IP         string
-	Port       int
-	Similarity float64
-	Method     string // "direct" or "host-header"
-}
-
-// ---------------------------------------------------------------------------
-// Main processing
-// ---------------------------------------------------------------------------
-
-func processDomain(domain, source, configPath string, threshold float64, workers int, verbose bool) {
-	config, err := loadConfig(configPath)
-	if err != nil {
-		config = &Config{}
-	}
-
-	mainDomain := extractMainDomain(domain)
-
-	// ── WAF Detection ──
-	sectionHeader("WAF Detection")
-
-	// Resolve current A records for the domain
-	currentIPs, dnsErr := net.LookupHost(domain)
-	if dnsErr != nil {
-		logError("Could not resolve domain %s: %v", domain, dnsErr)
-		return
-	}
-
-	// Build a set of current IPs for fast lookup
-	currentIPSet := make(map[string]bool)
-	for _, ip := range currentIPs {
-		currentIPSet[ip] = true
-	}
-
-	// Check if current IPs belong to known WAF/CDN ranges
-	behindWAF := false
-	for _, ip := range currentIPs {
-		if isWAFIP(ip) {
-			behindWAF = true
-			break
-		}
-	}
-
-	wafName := detectWAF(domain)
-
-	if wafName != "Unknown" {
-		logFound("Detected WAF: %s", wafName)
-		behindWAF = true
-	} else if behindWAF {
-		logFound("Domain resolves to known WAF/CDN IP range.")
-	}
-
-	logInfo("Current DNS A records: %s", strings.Join(currentIPs, ", "))
-
-	if !behindWAF {
-		logWarn("Domain does NOT appear to be behind a WAF/CDN.")
-		logWarn("Current IPs (%s) are not in known WAF/CDN ranges.", strings.Join(currentIPs, ", "))
-		logWarn("The domain may be directly accessible — no bypass needed.")
-		logInfo("Continuing anyway in case of an unrecognized WAF...")
-	}
-
-	// ── Favicon Hashes ──
-	sectionHeader("Favicon Fingerprint")
-	md5Hash, sha256Hash := getFaviconHashes(domain)
-	if md5Hash != "" {
-		logFound("Favicon MD5:    %s", md5Hash)
-		logFound("Favicon SHA256: %s", sha256Hash)
-		logInfo("Use these hashes to search Shodan/Censys for servers with the same favicon.")
-		logInfo("  Shodan:  http.favicon.hash:<mmh3_hash>")
-	} else {
-		logWarn("No favicon found or could not be fetched.")
-	}
-
-	// ── Fetch original HTML ──
-	sectionHeader("Reference HTML")
-	var originalHTML string
-	if source != "" {
-		content, err := os.ReadFile(source)
-		if err != nil {
-			logError("Error reading source HTML file: %v", err)
-			return
-		}
-		originalHTML = string(content)
-		logFound("Loaded reference HTML from file: %s", source)
-	} else {
-		originalHTML, _, err = fetchHTML("https://" + domain)
-		if err != nil {
-			originalHTML, _, err = fetchHTML("http://" + domain)
-			if err != nil {
-				logError("Error fetching original HTML. The WAF might be blocking.")
-				logInfo("Try providing the HTML manually using --source / -s.")
-				return
-			}
-		}
-		logFound("Fetched reference HTML from %s (%d chars)", domain, len(originalHTML))
-	}
-
-	// ── IP Discovery ──
-	sectionHeader("IP Discovery")
-	var allIPs []string
-	ipSources := make(map[string]string) // IP → source label
-
-	addIPs := func(source string, ips []string) {
-		for _, ip := range ips {
-			if !isWAFIP(ip) && !isPrivateIP(ip) {
-				if _, exists := ipSources[ip]; !exists {
-					ipSources[ip] = source
-				}
-			}
-		}
-		allIPs = append(allIPs, ips...)
-	}
-
-	// 1. SPF
-	if !silent {
-		fmt.Println()
-		boldWhite.Println("  [1/7] SPF Records")
-	}
-	spfIPs, err := extractIPsFromSPF(mainDomain)
-	if err != nil {
-		logWarn("Error fetching SPF records: %v", err)
-	} else {
-		logInfo("Found %d IP(s) from SPF.", len(spfIPs))
-		addIPs("SPF", spfIPs)
-	}
-
-	// 2. MX Records
-	if !silent {
-		boldWhite.Println("  [2/7] MX Records")
-	}
-	mxIPs, err := extractIPsFromMX(mainDomain)
-	if err != nil {
-		logWarn("Error fetching MX records: %v", err)
-	} else {
-		logInfo("Found %d IP(s) from MX records.", len(mxIPs))
-		addIPs("MX", mxIPs)
-	}
-
-	// 3. Common subdomains
-	if !silent {
-		boldWhite.Println("  [3/7] Common Origin Subdomains")
-	}
-	subIPs := extractIPsFromSubdomains(mainDomain, verbose)
-	logInfo("Found %d non-WAF IP(s) from %d subdomain probes.", len(subIPs), len(originSubdomains))
-	addIPs("Subdomain", subIPs)
-
-	// 4. Certificate Transparency
-	if !silent {
-		boldWhite.Println("  [4/7] Certificate Transparency (crt.sh)")
-	}
-	ctIPs, err := extractIPsFromCrtSh(mainDomain, verbose)
-	if err != nil {
-		logWarn("crt.sh error: %v", err)
-	} else {
-		logInfo("Found %d non-WAF IP(s) from CT logs.", len(ctIPs))
-		addIPs("CT/crt.sh", ctIPs)
-	}
-
-	// 5. ViewDNS
-	if !silent {
-		boldWhite.Println("  [5/7] ViewDNS IP History")
-	}
-	if config.ViewDNS != "" {
-		viewdnsIPs, err := fetchIPsFromViewDNS(mainDomain, config.ViewDNS)
-		if err != nil {
-			logWarn("ViewDNS error: %v", err)
-		} else {
-			logInfo("Found %d IP(s) from ViewDNS history.", len(viewdnsIPs))
-			addIPs("ViewDNS", viewdnsIPs)
-		}
-	} else if !silent {
-		dimWhite.Println("    Skipped — no API key. Add viewdns=<key> to config.")
-	}
-
-	// 6. SecurityTrails
-	if !silent {
-		boldWhite.Println("  [6/7] SecurityTrails DNS History")
-	}
-	if config.SecurityTrails != "" {
-		stIPs, err := fetchIPsFromSecurityTrails(mainDomain, config.SecurityTrails)
-		if err != nil {
-			logWarn("SecurityTrails error: %v", err)
-		} else {
-			logInfo("Found %d IP(s) from SecurityTrails.", len(stIPs))
-			addIPs("SecurityTrails", stIPs)
-		}
-	} else if !silent {
-		dimWhite.Println("    Skipped — no API key. Add securitytrails=<key> to config.")
-	}
-
-	// 7. Censys (requires paid license)
-	if !silent {
-		boldWhite.Println("  [7/7] Censys SSL Certificate Search (paid license required)")
-	}
-	if config.CensysToken != "" {
-		censysIPs, err := fetchIPsFromCensys(mainDomain, config.CensysToken, config.CensysOrgID)
-		if err != nil {
-			logWarn("Censys error: %v", err)
-		} else {
-			logInfo("Found %d non-WAF IP(s) from Censys.", len(censysIPs))
-			addIPs("Censys", censysIPs)
-		}
-	} else if !silent {
-		dimWhite.Println("    Skipped — no API key. Add censys_token + censys_org_id to config.")
-		dimWhite.Println("    Note: Censys API requires a paid license with an Organization ID.")
-	}
-
-	// Filter and deduplicate
-	uniqueIPs := unique(allIPs)
-
-	// Remove known WAF/CDN IPs and current domain IPs (same IP = not a bypass)
-	var candidateIPs []string
-	for _, ip := range uniqueIPs {
-		if !isWAFIP(ip) && !isPrivateIP(ip) && !currentIPSet[ip] {
-			candidateIPs = append(candidateIPs, ip)
-		}
-	}
-
-	sectionHeader("Summary")
-	logInfo("Total IPs collected: %d", len(allIPs))
-	logInfo("Unique IPs: %d", len(uniqueIPs))
-	logInfo("After filtering WAF/CDN + current domain IPs: %d candidate(s)", len(candidateIPs))
-
-	if len(candidateIPs) == 0 {
-		if !silent {
-			fmt.Println()
-			boldRed.Println("  ✗ No candidate IPs found. WAF bypass not possible with passive methods.")
-			fmt.Println()
-		}
-		return
-	}
-
-	// ── Port Scanning ──
-	sectionHeader("Web Server Detection")
-	logInfo("Scanning %d candidate IPs on ports %v...", len(candidateIPs), webPorts)
-
-	var webServers []webServerResult
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	runningCounter := 0
-	checkedCounter := 0
-	sem := make(chan struct{}, workers)
-
-	for _, ip := range candidateIPs {
-		wg.Add(1)
-		go func(ip string) {
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			checkWebServer(ip, &wg, &mu, &webServers, &runningCounter, &checkedCounter, len(candidateIPs))
-		}(ip)
-	}
-	wg.Wait()
-	if !silent {
-		fmt.Printf("\r  Scanning complete: %d/%d IPs have a web server.                    \n", runningCounter, len(candidateIPs))
-	}
-
-	if len(webServers) == 0 {
-		if !silent {
-			fmt.Println()
-			boldRed.Println("  ✗ No web servers found on candidate IPs. WAF bypass not found.")
-			fmt.Println()
-		}
-		return
-	}
-
-	// ── HTML Comparison ──
-	sectionHeader("Origin Server Verification")
-	logInfo("Comparing HTML responses from %d web servers (threshold: %.0f%%)...", len(webServers), threshold)
-	logInfo("Testing both direct IP access and Host-header injection.\n")
-
-	var bypassResults []BypassResult
-
-	checked := 0
-	total := len(webServers)
-
-	for _, ws := range webServers {
-		checked++
-		for _, port := range ws.Ports {
-			var scheme string
-			switch port {
-			case 443, 8443, 9443:
-				scheme = "https"
-			default:
-				scheme = "http"
-			}
-
-			url := fmt.Sprintf("%s://%s:%d", scheme, ws.IP, port)
-
-			// Method 1: Direct IP access
-			fetchedHTML, statusCode, err := fetchHTML(url)
-			if err == nil && statusCode < 500 {
-				similarity := compareHTML(originalHTML, fetchedHTML) * 100
-				if similarity > threshold {
-					bypassResults = append(bypassResults, BypassResult{
-						IP: ws.IP, Port: port, Similarity: similarity, Method: "direct",
-					})
-				}
-			}
-
-			// Method 2: Host header injection
-			fetchedHTML2, statusCode2, err := fetchHTMLWithHost(url, domain)
-			if err == nil && statusCode2 < 500 {
-				similarity2 := compareHTML(originalHTML, fetchedHTML2) * 100
-				if similarity2 > threshold {
-					bypassResults = append(bypassResults, BypassResult{
-						IP: ws.IP, Port: port, Similarity: similarity2, Method: "host-header",
-					})
-				}
-			}
-		}
-		if !silent {
-			fmt.Printf("\r  Verified %d/%d web servers...", checked, total)
-		}
-	}
-	if !silent {
-		fmt.Println()
-	}
-
-	// ── Results ──
-	sectionHeader("Results")
-
-	if len(bypassResults) > 0 {
-		// Sort by similarity descending
-		sort.Slice(bypassResults, func(i, j int) bool {
-			return bypassResults[i].Similarity > bypassResults[j].Similarity
-		})
-
-		// Deduplicate by IP+Port, keeping highest similarity
-		seen := make(map[string]bool)
-		var dedupResults []BypassResult
-		for _, r := range bypassResults {
-			key := fmt.Sprintf("%s:%d", r.IP, r.Port)
-			if !seen[key] {
-				seen[key] = true
-				dedupResults = append(dedupResults, r)
-			}
-		}
-
-		if silent {
-			// Silent mode: one IP per line, nothing else
-			printedIPs := make(map[string]bool)
-			for _, r := range dedupResults {
-				if !printedIPs[r.IP] {
-					fmt.Println(r.IP)
-					printedIPs[r.IP] = true
-				}
-			}
-		} else {
-			for _, r := range dedupResults {
-				src := ipSources[r.IP]
-				if src == "" {
-					src = "unknown"
-				}
-
-				var scheme string
-				switch r.Port {
-				case 443, 8443, 9443:
-					scheme = "https"
-				default:
-					scheme = "http"
-				}
-
-				fmt.Println()
-				boldGreen.Printf("  ✓ POSSIBLE WAF BYPASS FOUND\n")
-				logInfo("IP:         %s", r.IP)
-				logInfo("Port:       %d", r.Port)
-				logInfo("Method:     %s", r.Method)
-				logInfo("Similarity: %.1f%%", r.Similarity)
-				logInfo("Source:     %s", src)
-				logInfo("Verify:     curl -sk -H \"Host: %s\" %s://%s:%d/", domain, scheme, r.IP, r.Port)
-			}
-		}
-	} else if !silent {
-		boldRed.Println("  ✗ WAF bypass not found with passive techniques.")
-		fmt.Println()
-		logInfo("Suggestions:")
-		logInfo("  • Try lowering the threshold with -t 40")
-		logInfo("  • Provide the HTML manually with -s if the WAF blocks fetching")
-		logInfo("  • Add API keys for ViewDNS, SecurityTrails, Censys (paid license)")
-		logInfo("  • Search Shodan/Censys manually with the favicon hashes above")
-		logInfo("  • Look for SSRF vulnerabilities to induce outbound connections")
-	}
-	if !silent {
-		fmt.Println()
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
+const version = "3.0.0"
 
 func main() {
 	domain := flag.String("domain", "", "The domain to check")
@@ -1397,27 +40,705 @@ func main() {
 	help := flag.Bool("help", false, "Display help information")
 	flag.BoolVar(help, "h", false, "Display help information (shorthand)")
 
+	// New flags
+	showVersion := flag.Bool("version", false, "Print version and exit")
+	timeoutSec := flag.Int("timeout", 10, "HTTP timeout in seconds")
+	rateLimit := flag.Int("rate-limit", 0, "Max HTTP requests per second (0=unlimited)")
+	proxyURL := flag.String("proxy", "", "Proxy URL (http:// or socks5://)")
+	scanNeighbors := flag.Bool("scan-neighbors", false, "Scan /24 neighbors of confirmed bypass IPs")
+	jsonOutput := flag.Bool("json", false, "Output results as JSON")
+	listFile := flag.String("list", "", "File containing domains to check, one per line")
+	flag.StringVar(listFile, "l", "", "File containing domains (shorthand)")
+	outputFile := flag.String("output", "", "Write results to file")
+	flag.StringVar(outputFile, "o", "", "Write results to file (shorthand)")
+
 	flag.Parse()
 
-	if *help || *domain == "" {
+	if *showVersion {
+		fmt.Printf("unwaf v%s\n", version)
+		os.Exit(0)
+	}
+
+	if *help || (*domain == "" && *listFile == "") {
 		showUsage()
 		os.Exit(1)
 	}
 
-	// Normalize: strip scheme, path, port, trailing slashes
-	*domain = sanitizeDomain(*domain)
-	if *domain == "" {
-		fmt.Println("Error: invalid domain after sanitization.")
+	// Set up context with signal handling
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	// Initialize HTTP client
+	timeout := time.Duration(*timeoutSec) * time.Second
+	appHTTPClient = newHTTPClient(timeout, *proxyURL)
+
+	// Initialize rate limiter
+	if *rateLimit > 0 {
+		rateLimiter = rate.NewLimiter(rate.Limit(*rateLimit), *rateLimit)
+	}
+
+	// Silent mode for JSON or quiet
+	silent = *quiet || *jsonOutput
+
+	// Collect domains
+	var domains []string
+	if *listFile != "" {
+		f, err := os.Open(*listFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error opening list file: %v\n", err)
+			os.Exit(1)
+		}
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			d := sanitizeDomain(line)
+			if d != "" {
+				domains = append(domains, d)
+			}
+		}
+		f.Close()
+		if len(domains) == 0 {
+			fmt.Fprintln(os.Stderr, "Error: no valid domains in list file.")
+			os.Exit(1)
+		}
+	}
+	if *domain != "" {
+		d := sanitizeDomain(*domain)
+		if d == "" {
+			fmt.Fprintln(os.Stderr, "Error: invalid domain after sanitization.")
+			os.Exit(1)
+		}
+		domains = append(domains, d)
+	}
+
+	if len(domains) == 0 {
+		showUsage()
 		os.Exit(1)
 	}
 
-	silent = *quiet
-
-	if !silent {
-		fmt.Println(logo)
-		dimWhite.Printf("  v%s — Passive WAF bypass tool by Martín Martín\n", version)
-		dimWhite.Printf("  Target: %s\n", *domain)
+	portTimeout := timeout / 5
+	if portTimeout < 2*time.Second {
+		portTimeout = 2 * time.Second
 	}
 
-	processDomain(*domain, *source, *configPath, *threshold, *numWorkers, *verbose)
+	opts := &processOptions{
+		source:        *source,
+		configPath:    *configPath,
+		threshold:     *threshold,
+		workers:       *numWorkers,
+		verbose:       *verbose,
+		scanNeighbors: *scanNeighbors,
+		jsonMode:      *jsonOutput,
+		outputFile:    *outputFile,
+		portTimeout:   portTimeout,
+	}
+
+	if *jsonOutput && len(domains) > 1 {
+		// Batch JSON: array of results
+		var allOutputs []JSONOutput
+		for _, d := range domains {
+			if ctx.Err() != nil {
+				break
+			}
+			result := processDomain(ctx, d, opts)
+			if result != nil {
+				allOutputs = append(allOutputs, *result)
+			}
+		}
+		data, _ := json.MarshalIndent(allOutputs, "", "  ")
+		if *outputFile != "" {
+			os.WriteFile(*outputFile, data, 0644)
+		} else {
+			fmt.Println(string(data))
+		}
+	} else if *jsonOutput {
+		result := processDomain(ctx, domains[0], opts)
+		if result != nil {
+			writeJSONOutput(result, *outputFile)
+		}
+	} else {
+		for _, d := range domains {
+			if ctx.Err() != nil {
+				break
+			}
+			if !silent {
+				fmt.Print(logo)
+				dimWhite.Printf("  v%s — Passive WAF bypass tool by Martín Martín\n", version)
+				dimWhite.Printf("  Target: %s\n", d)
+			}
+			result := processDomain(ctx, d, opts)
+			if !*jsonOutput && *outputFile != "" && result != nil && len(result.Bypasses) > 0 {
+				writeTextOutput(result.Bypasses, *outputFile)
+			}
+		}
+	}
+}
+
+type processOptions struct {
+	source        string
+	configPath    string
+	threshold     float64
+	workers       int
+	verbose       bool
+	scanNeighbors bool
+	jsonMode      bool
+	outputFile    string
+	portTimeout   time.Duration
+}
+
+type discoveryStep struct {
+	name    string
+	label   string
+	enabled bool
+	run     func() ([]string, error)
+}
+
+func processDomain(ctx context.Context, domain string, opts *processOptions) *JSONOutput {
+	config, err := loadConfig(opts.configPath)
+	if err != nil {
+		config = &Config{}
+	}
+
+	mainDomain := extractMainDomain(domain)
+
+	jsonOut := &JSONOutput{
+		Version:   version,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Domain:    domain,
+		Sources:   make(map[string]int),
+	}
+
+	// ── Dynamic Cloudflare CIDRs ──
+	beforeCF := wafCIDRCount()
+	fetchCloudflareRanges(ctx, appHTTPClient)
+	afterCF := wafCIDRCount()
+	if diff := afterCF - beforeCF; diff > 0 {
+		logVerbose(opts.verbose, "Added %d dynamic Cloudflare CIDRs", diff)
+	}
+
+	// ── WAF Detection ──
+	sectionHeader("WAF Detection")
+
+	currentIPs, dnsErr := net.LookupHost(domain)
+	if dnsErr != nil {
+		logError("Could not resolve domain %s: %v", domain, dnsErr)
+		return nil
+	}
+
+	jsonOut.CurrentIPs = currentIPs
+
+	currentIPSet := make(map[string]bool)
+	for _, ip := range currentIPs {
+		currentIPSet[ip] = true
+	}
+
+	behindWAF := false
+	for _, ip := range currentIPs {
+		if isWAFIP(ip) {
+			behindWAF = true
+			break
+		}
+	}
+
+	wafName := detectWAF(ctx, domain, appHTTPClient)
+
+	if wafName != "Unknown" {
+		logFound("Detected WAF: %s", wafName)
+		behindWAF = true
+	} else if behindWAF {
+		logFound("Domain resolves to known WAF/CDN IP range.")
+	}
+
+	jsonOut.WAFDetected = behindWAF
+	jsonOut.WAFName = wafName
+
+	logInfo("Current DNS A records: %s", strings.Join(currentIPs, ", "))
+
+	if !behindWAF {
+		logWarn("Domain does NOT appear to be behind a WAF/CDN.")
+		logWarn("Current IPs (%s) are not in known WAF/CDN ranges.", strings.Join(currentIPs, ", "))
+		logWarn("The domain may be directly accessible — no bypass needed.")
+		logInfo("Continuing anyway in case of an unrecognized WAF...")
+	}
+
+	// ── Favicon Hashes ──
+	sectionHeader("Favicon Fingerprint")
+	faviconHashes := getFaviconHashes(ctx, domain)
+	var mmh3Hash int32
+	if faviconHashes != nil {
+		logFound("Favicon MD5:    %s", faviconHashes.MD5)
+		logFound("Favicon SHA256: %s", faviconHashes.SHA256)
+		logFound("Favicon MMH3:   %d", faviconHashes.MMH3)
+		logInfo("Shodan query: http.favicon.hash:%d", faviconHashes.MMH3)
+		mmh3Hash = faviconHashes.MMH3
+		jsonOut.FaviconMD5 = faviconHashes.MD5
+		jsonOut.FaviconSHA256 = faviconHashes.SHA256
+		jsonOut.FaviconMMH3 = faviconHashes.MMH3
+	} else {
+		logWarn("No favicon found or could not be fetched.")
+	}
+
+	// ── Fetch original HTML + headers ──
+	sectionHeader("Reference HTML")
+	var originalHTML string
+	var originalStatusCode int
+	var originalHeaders http.Header
+	if opts.source != "" {
+		content, err := os.ReadFile(opts.source)
+		if err != nil {
+			logError("Error reading source HTML file: %v", err)
+			return nil
+		}
+		originalHTML = string(content)
+		logFound("Loaded reference HTML from file: %s", opts.source)
+	} else {
+		var fetchErr error
+		originalHTML, originalStatusCode, originalHeaders, fetchErr = fetchHTMLWithHeaders(ctx, "https://"+domain, "")
+		if fetchErr != nil {
+			originalHTML, originalStatusCode, originalHeaders, fetchErr = fetchHTMLWithHeaders(ctx, "http://"+domain, "")
+			if fetchErr != nil {
+				logError("Error fetching original HTML. The WAF might be blocking.")
+				logInfo("Try providing the HTML manually using --source / -s.")
+				return nil
+			}
+		}
+		logFound("Fetched reference HTML from %s (%d chars, status %d)", domain, len(originalHTML), originalStatusCode)
+	}
+
+	// ── IP Discovery ──
+	sectionHeader("IP Discovery")
+	var allIPs []string
+	ipSources := make(map[string]string)
+
+	addIPs := func(source string, ips []string) {
+		for _, ip := range ips {
+			if !isWAFIP(ip) && !isPrivateIP(ip) {
+				if _, exists := ipSources[ip]; !exists {
+					ipSources[ip] = source
+				}
+			}
+		}
+		allIPs = append(allIPs, ips...)
+		jsonOut.Sources[source] = len(ips)
+	}
+
+	// Build dynamic discovery steps
+	steps := []discoveryStep{
+		{name: "SPF", label: "SPF Records", enabled: true, run: func() ([]string, error) {
+			return extractIPsFromSPF(mainDomain)
+		}},
+		{name: "MX", label: "MX Records", enabled: true, run: func() ([]string, error) {
+			return extractIPsFromMX(mainDomain)
+		}},
+		{name: "Subdomain", label: "Common Origin Subdomains", enabled: true, run: func() ([]string, error) {
+			return extractIPsFromSubdomains(ctx, mainDomain, opts.verbose), nil
+		}},
+		{name: "CT/crt.sh", label: "Certificate Transparency (crt.sh)", enabled: true, run: func() ([]string, error) {
+			return extractIPsFromCrtSh(ctx, mainDomain, opts.verbose)
+		}},
+		{name: "OTX", label: "AlienVault OTX Passive DNS", enabled: true, run: func() ([]string, error) {
+			return fetchIPsFromOTX(ctx, mainDomain, config.OTXAPIKey)
+		}},
+		{name: "RapidDNS", label: "RapidDNS Subdomains", enabled: true, run: func() ([]string, error) {
+			return fetchIPsFromRapidDNS(ctx, mainDomain, opts.verbose)
+		}},
+		{name: "HackerTarget", label: "HackerTarget Host Search", enabled: true, run: func() ([]string, error) {
+			return fetchIPsFromHackerTarget(ctx, mainDomain)
+		}},
+		{name: "Wayback", label: "Wayback Machine Archives", enabled: true, run: func() ([]string, error) {
+			return fetchIPsFromWayback(ctx, mainDomain, opts.verbose)
+		}},
+		{name: "ViewDNS", label: "ViewDNS IP History", enabled: config.ViewDNS != "", run: func() ([]string, error) {
+			return fetchIPsFromViewDNS(ctx, mainDomain, config.ViewDNS)
+		}},
+		{name: "SecurityTrails", label: "SecurityTrails DNS History", enabled: config.SecurityTrails != "", run: func() ([]string, error) {
+			return fetchIPsFromSecurityTrails(ctx, mainDomain, config.SecurityTrails)
+		}},
+		{name: "Censys", label: "Censys SSL Certificate Search", enabled: config.CensysToken != "", run: func() ([]string, error) {
+			return fetchIPsFromCensys(ctx, mainDomain, config.CensysToken, config.CensysOrgID)
+		}},
+		{name: "Shodan", label: "Shodan Host Search", enabled: config.ShodanAPIKey != "", run: func() ([]string, error) {
+			return fetchIPsFromShodan(ctx, mainDomain, config.ShodanAPIKey, mmh3Hash)
+		}},
+		{name: "DNSDB", label: "DNSDB Historical DNS", enabled: config.DNSDBAPIKey != "", run: func() ([]string, error) {
+			return fetchIPsFromDNSDB(ctx, mainDomain, config.DNSDBAPIKey)
+		}},
+	}
+
+	totalSteps := 0
+	for _, s := range steps {
+		if s.enabled {
+			totalSteps++
+		}
+	}
+
+	stepNum := 0
+	for _, step := range steps {
+		if ctx.Err() != nil {
+			break
+		}
+
+		if step.enabled {
+			stepNum++
+			if !silent {
+				fmt.Println()
+				boldWhite.Printf("  [%d/%d] %s\n", stepNum, totalSteps, step.label)
+			}
+			ips, err := step.run()
+			if err != nil {
+				logWarn("%s error: %v", step.name, err)
+			} else {
+				logInfo("Found %d IP(s) from %s.", len(ips), step.name)
+				addIPs(step.name, ips)
+			}
+		} else if !silent {
+			// Show skipped API steps
+			switch step.name {
+			case "ViewDNS":
+				fmt.Println()
+				boldWhite.Printf("  [skip] %s\n", step.label)
+				dimWhite.Println("    Skipped — no API key. Add viewdns=<key> to config.")
+			case "SecurityTrails":
+				fmt.Println()
+				boldWhite.Printf("  [skip] %s\n", step.label)
+				dimWhite.Println("    Skipped — no API key. Add securitytrails=<key> to config.")
+			case "Censys":
+				fmt.Println()
+				boldWhite.Printf("  [skip] %s\n", step.label)
+				dimWhite.Println("    Skipped — no API key. Add censys_token + censys_org_id to config.")
+				dimWhite.Println("    Note: Censys API requires a paid license with an Organization ID.")
+			case "Shodan":
+				fmt.Println()
+				boldWhite.Printf("  [skip] %s\n", step.label)
+				dimWhite.Println("    Skipped — no API key. Add shodan_api_key=<key> to config.")
+			case "DNSDB":
+				fmt.Println()
+				boldWhite.Printf("  [skip] %s\n", step.label)
+				dimWhite.Println("    Skipped — no API key. Add dnsdb_api_key=<key> to config.")
+			}
+		}
+	}
+
+	// Filter and deduplicate
+	uniqueIPs := unique(allIPs)
+
+	var candidateIPs []string
+	for _, ip := range uniqueIPs {
+		if !isWAFIP(ip) && !isPrivateIP(ip) && !currentIPSet[ip] {
+			candidateIPs = append(candidateIPs, ip)
+		}
+	}
+
+	sectionHeader("Summary")
+	logInfo("Total IPs collected: %d", len(allIPs))
+	logInfo("Unique IPs: %d", len(uniqueIPs))
+	logInfo("After filtering WAF/CDN + current domain IPs: %d candidate(s)", len(candidateIPs))
+	jsonOut.CandidateIPs = len(candidateIPs)
+
+	if len(candidateIPs) == 0 {
+		if !silent {
+			fmt.Println()
+			boldRed.Println("  ✗ No candidate IPs found. WAF bypass not possible with passive methods.")
+			fmt.Println()
+		}
+		return jsonOut
+	}
+
+	// ── Port Scanning ──
+	sectionHeader("Web Server Detection")
+	logInfo("Scanning %d candidate IPs on ports %v...", len(candidateIPs), webPorts)
+
+	var webServers []webServerResult
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, opts.workers)
+
+	bar := newProgressBar(len(candidateIPs), "Scanning")
+
+	for _, ip := range candidateIPs {
+		wg.Add(1)
+		go func(ip string) {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			checkWebServer(ctx, ip, opts.portTimeout, &wg, &mu, &webServers, bar, len(candidateIPs))
+		}(ip)
+	}
+	wg.Wait()
+	bar.Finish()
+
+	if !silent {
+		fmt.Printf("  Scanning complete: %d/%d IPs have a web server.\n", len(webServers), len(candidateIPs))
+	}
+
+	jsonOut.WebServers = len(webServers)
+
+	if len(webServers) == 0 {
+		if !silent {
+			fmt.Println()
+			boldRed.Println("  ✗ No web servers found on candidate IPs. WAF bypass not found.")
+			fmt.Println()
+		}
+		return jsonOut
+	}
+
+	// ── HTML Comparison + Verification ──
+	sectionHeader("Origin Server Verification")
+	logInfo("Comparing HTML responses from %d web servers (threshold: %.0f%%)...", len(webServers), opts.threshold)
+	logInfo("Testing both direct IP access and Host-header injection.")
+
+	var bypassResults []BypassResult
+
+	verifyBar := newProgressBar(len(webServers), "Verifying")
+
+	for _, ws := range webServers {
+		if ctx.Err() != nil {
+			break
+		}
+		for _, port := range ws.Ports {
+			var scheme string
+			if isTLSPort(port) {
+				scheme = "https"
+			} else {
+				scheme = "http"
+			}
+
+			urlStr := fmt.Sprintf("%s://%s:%d", scheme, ws.IP, port)
+
+			// Method 1: Direct IP access
+			fetchedHTML, statusCode, candHeaders, fetchErr := fetchHTMLWithHeaders(ctx, urlStr, "")
+			if fetchErr == nil && statusCode < 500 {
+				htmlSim := compareHTML(originalHTML, fetchedHTML)
+
+				var certMatch float64
+				if isTLSPort(port) {
+					certMatch = compareTLSCerts(ctx, domain, ws.IP, port)
+				}
+
+				headerMatch := compareResponseHeaders(originalHeaders, candHeaders)
+				overallScore := calculateOverallScore(htmlSim, certMatch, headerMatch, originalStatusCode, statusCode) * 100
+
+				if overallScore > opts.threshold {
+					src := ipSources[ws.IP]
+					if src == "" {
+						src = "unknown"
+					}
+					bypassResults = append(bypassResults, BypassResult{
+						IP:           ws.IP,
+						Port:         port,
+						Similarity:   htmlSim * 100,
+						Method:       "direct",
+						StatusCode:   statusCode,
+						CertMatch:    certMatch * 100,
+						HeaderMatch:  headerMatch * 100,
+						OverallScore: overallScore,
+						Source:       src,
+					})
+				}
+			}
+
+			// Method 2: Host header injection
+			fetchedHTML2, statusCode2, candHeaders2, fetchErr2 := fetchHTMLWithHeaders(ctx, urlStr, domain)
+			if fetchErr2 == nil && statusCode2 < 500 {
+				htmlSim2 := compareHTML(originalHTML, fetchedHTML2)
+
+				var certMatch2 float64
+				if isTLSPort(port) {
+					certMatch2 = compareTLSCerts(ctx, domain, ws.IP, port)
+				}
+
+				headerMatch2 := compareResponseHeaders(originalHeaders, candHeaders2)
+				overallScore2 := calculateOverallScore(htmlSim2, certMatch2, headerMatch2, originalStatusCode, statusCode2) * 100
+
+				if overallScore2 > opts.threshold {
+					src := ipSources[ws.IP]
+					if src == "" {
+						src = "unknown"
+					}
+					bypassResults = append(bypassResults, BypassResult{
+						IP:           ws.IP,
+						Port:         port,
+						Similarity:   htmlSim2 * 100,
+						Method:       "host-header",
+						StatusCode:   statusCode2,
+						CertMatch:    certMatch2 * 100,
+						HeaderMatch:  headerMatch2 * 100,
+						OverallScore: overallScore2,
+						Source:       src,
+					})
+				}
+			}
+		}
+		verifyBar.Increment()
+	}
+	verifyBar.Finish()
+
+	// ── Neighbor Scanning ──
+	if opts.scanNeighbors && len(bypassResults) > 0 {
+		sectionHeader("Neighbor Scanning (/24)")
+		confirmedIPs := make([]string, 0)
+		seen := make(map[string]bool)
+		for _, r := range bypassResults {
+			if !seen[r.IP] {
+				confirmedIPs = append(confirmedIPs, r.IP)
+				seen[r.IP] = true
+			}
+		}
+
+		neighborIPs := expandToNeighborhood(confirmedIPs)
+		logInfo("Scanning %d neighbor IPs from /24 subnets...", len(neighborIPs))
+
+		if len(neighborIPs) > 0 {
+			var neighborWebServers []webServerResult
+			var nmu sync.Mutex
+			var nwg sync.WaitGroup
+			nsem := make(chan struct{}, opts.workers)
+
+			nbar := newProgressBar(len(neighborIPs), "Neighbor scan")
+
+			for _, ip := range neighborIPs {
+				if ctx.Err() != nil {
+					break
+				}
+				nwg.Add(1)
+				go func(ip string) {
+					nsem <- struct{}{}
+					defer func() { <-nsem }()
+					checkWebServer(ctx, ip, opts.portTimeout, &nwg, &nmu, &neighborWebServers, nbar, len(neighborIPs))
+				}(ip)
+			}
+			nwg.Wait()
+			nbar.Finish()
+
+			logInfo("Found %d web servers in neighbor IPs.", len(neighborWebServers))
+
+			for _, ws := range neighborWebServers {
+				if ctx.Err() != nil {
+					break
+				}
+				for _, port := range ws.Ports {
+					var scheme string
+					if isTLSPort(port) {
+						scheme = "https"
+					} else {
+						scheme = "http"
+					}
+					urlStr := fmt.Sprintf("%s://%s:%d", scheme, ws.IP, port)
+
+					fetchedHTML, statusCode, candHeaders, fetchErr := fetchHTMLWithHeaders(ctx, urlStr, domain)
+					if fetchErr == nil && statusCode < 500 {
+						htmlSim := compareHTML(originalHTML, fetchedHTML)
+
+						var certMatch float64
+						if isTLSPort(port) {
+							certMatch = compareTLSCerts(ctx, domain, ws.IP, port)
+						}
+
+						headerMatch := compareResponseHeaders(originalHeaders, candHeaders)
+						overallScore := calculateOverallScore(htmlSim, certMatch, headerMatch, originalStatusCode, statusCode) * 100
+
+						if overallScore > opts.threshold {
+							bypassResults = append(bypassResults, BypassResult{
+								IP:           ws.IP,
+								Port:         port,
+								Similarity:   htmlSim * 100,
+								Method:       "host-header (neighbor)",
+								StatusCode:   statusCode,
+								CertMatch:    certMatch * 100,
+								HeaderMatch:  headerMatch * 100,
+								OverallScore: overallScore,
+								Source:       "Neighbor /24",
+							})
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// ── Results ──
+	sectionHeader("Results")
+
+	if len(bypassResults) > 0 {
+		// Sort by OverallScore descending
+		sort.Slice(bypassResults, func(i, j int) bool {
+			return bypassResults[i].OverallScore > bypassResults[j].OverallScore
+		})
+
+		// Deduplicate by IP+Port, keeping highest score
+		seen := make(map[string]bool)
+		var dedupResults []BypassResult
+		for _, r := range bypassResults {
+			key := fmt.Sprintf("%s:%d", r.IP, r.Port)
+			if !seen[key] {
+				seen[key] = true
+				dedupResults = append(dedupResults, r)
+			}
+		}
+
+		// ASN lookup for final results
+		if len(dedupResults) > 0 {
+			lookupASNBatch(ctx, dedupResults, appHTTPClient)
+		}
+
+		jsonOut.Bypasses = dedupResults
+
+		if !opts.jsonMode {
+			if silent {
+				// Silent mode: one IP per line
+				printedIPs := make(map[string]bool)
+				for _, r := range dedupResults {
+					if !printedIPs[r.IP] {
+						fmt.Println(r.IP)
+						printedIPs[r.IP] = true
+					}
+				}
+			} else {
+				for _, r := range dedupResults {
+					var scheme string
+					if isTLSPort(r.Port) {
+						scheme = "https"
+					} else {
+						scheme = "http"
+					}
+
+					fmt.Println()
+					boldGreen.Printf("  ✓ POSSIBLE WAF BYPASS FOUND\n")
+					logInfo("IP:           %s", r.IP)
+					logInfo("Port:         %d", r.Port)
+					logInfo("Method:       %s", r.Method)
+					logInfo("Overall:      %.1f%%", r.OverallScore)
+					logInfo("  HTML sim:   %.1f%%", r.Similarity)
+					logInfo("  Cert match: %.1f%%", r.CertMatch)
+					logInfo("  Header:     %.1f%%", r.HeaderMatch)
+					logInfo("Status:       %d", r.StatusCode)
+					logInfo("Source:       %s", r.Source)
+					if r.ASN != "" {
+						logInfo("ASN:          %s %s", r.ASN, r.ASNOrg)
+					}
+					logInfo("Verify:       curl -sk -H \"Host: %s\" %s://%s:%d/", domain, scheme, r.IP, r.Port)
+				}
+			}
+		}
+	} else {
+		jsonOut.Bypasses = []BypassResult{}
+		if !opts.jsonMode && !silent {
+			boldRed.Println("  ✗ WAF bypass not found with passive techniques.")
+			fmt.Println()
+			logInfo("Suggestions:")
+			logInfo("  • Try lowering the threshold with -t 40")
+			logInfo("  • Provide the HTML manually with -s if the WAF blocks fetching")
+			logInfo("  • Add API keys for ViewDNS, SecurityTrails, Censys, Shodan, DNSDB")
+			logInfo("  • Search Shodan manually with the favicon hashes above")
+			logInfo("  • Try --scan-neighbors to scan /24 neighborhoods")
+			logInfo("  • Look for SSRF vulnerabilities to induce outbound connections")
+		}
+	}
+	if !silent {
+		fmt.Println()
+	}
+
+	return jsonOut
 }

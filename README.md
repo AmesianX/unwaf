@@ -1,26 +1,39 @@
 
-# Unwaf v2.0
+# Unwaf v3.0
 
-Unwaf is a Go tool designed to help identify WAF bypasses using **passive techniques**. It automates the process of discovering the real origin IP behind a WAF/CDN by combining multiple discovery methods and verifying candidates through HTML similarity comparison.
+[![Go Version](https://img.shields.io/github/go-mod/go-version/mmarting/unwaf)](https://go.dev/)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+
+Unwaf is a Go tool designed to help identify WAF bypasses using **passive techniques**. It automates the process of discovering the real origin IP behind a WAF/CDN by combining multiple discovery methods and verifying candidates through HTML similarity comparison, SSL certificate fingerprinting, and HTTP header analysis.
 
 Unwaf is automating the steps I explained on this LinkedIn Post: [Passive WAF bypassing](https://www.linkedin.com/posts/martinmarting_bugbounty-bugbountytips-pentesting-activity-7217385665729093632-oZEP)
 
-## What's new in v2.0
+## What's new in v3.0
 
-- **4 new free discovery methods** — MX records, subdomain probing (30+ common names), Certificate Transparency (crt.sh), WAF fingerprinting
-- **Censys SSL certificate search** — finds hosts presenting certs matching the domain via the Platform API v3 (requires a paid Censys license with Organization ID)
-- **WAF confirmation** — resolves the domain's A records and checks if they belong to known WAF/CDN ranges before scanning, avoiding false positives on unprotected domains
-- **WAF fingerprinting** — identifies Cloudflare, Akamai, AWS CloudFront, Fastly, Sucuri, Imperva, and more via HTTP headers
-- **Favicon hashing** — generates MD5/SHA256 hashes for manual Shodan/Censys lookups
-- **Host-header injection** — tests candidate IPs with the original `Host` header (catches virtual hosts)
-- **WAF/CDN IP filtering** — automatically discards IPs belonging to known CDN ranges + the domain's current A records
-- **Smart domain input** — accepts both `example.com` and `https://example.com/path`
-- **Extended port scanning** — checks ports 80, 443, 8080, 8443, 8000, 8008, 8888, 9443
-- **Quiet mode** (`-q`) — outputs only bypass IPs, one per line, for piping into other tools
-- **Configurable threshold and concurrency** (`-t`, `-w` flags)
-- **Verbose mode** (`-v`) for debugging
-- **Updated dependencies** — Go 1.23, latest library versions
-- **Improved output** — color-coded sections and actionable `curl` verification commands
+- **6 new discovery methods** — AlienVault OTX, RapidDNS, HackerTarget, Wayback Machine, Shodan, DNSDB/Farsight
+- **MMH3 favicon hashing** — computes MurmurHash3 for direct Shodan `http.favicon.hash` queries
+- **Shodan API integration** — searches by SSL cert CN, hostname, and favicon hash
+- **DNSDB/Farsight integration** — historical DNS record lookup via NDJSON API
+- **SSL certificate fingerprint matching** — compares serial numbers, CN, and SAN overlap between domain and candidate
+- **HTTP response header comparison** — compares Server, X-Powered-By, and Set-Cookie headers
+- **Status code matching** — boosts or penalizes candidates based on HTTP status code alignment
+- **Overall scoring system** — 60% HTML similarity + 25% cert match + 15% header match + status adjustment
+- **CIDR neighbor scanning** (`--scan-neighbors`) — scans /24 neighbors of confirmed bypass IPs
+- **JSON output** (`--json`) — structured JSON for automation and integration
+- **Batch mode** (`-l domains.txt`) — process multiple domains from a file
+- **File output** (`-o results.txt`) — write results to a file
+- **ASN lookup** — identifies the ASN and organization for confirmed bypass IPs
+- **Progress bars** — visual progress tracking for port scanning and verification
+- **Context/cancellation** — clean Ctrl+C handling with graceful shutdown
+- **Configurable timeout** (`--timeout`) — adjustable HTTP timeout
+- **Rate limiting** (`--rate-limit`) — control request rate to avoid bans
+- **Retry logic** — automatic retry with exponential backoff on 429/5xx
+- **Proxy support** (`--proxy`) — HTTP and SOCKS5 proxy support
+- **Dynamic Cloudflare CIDRs** — fetches live IP ranges from Cloudflare at runtime
+- **IPv6 WAF CIDRs** — Cloudflare, Akamai, Fastly, and CloudFront IPv6 ranges
+- **More WAF signatures** — FortiWeb, Radware, Azure Front Door, Google Cloud Armor, Vercel, Netlify
+- **Dynamic step counter** — discovery steps adjust based on which API keys are configured
+- **Multi-file codebase** — split into 13 files for maintainability
 
 ## Discovery methods
 
@@ -30,11 +43,26 @@ Unwaf is automating the steps I explained on this LinkedIn Post: [Passive WAF by
 | MX records | Free | Resolves mail server hostnames (skips Google/Microsoft/etc.) |
 | Subdomain probing | Free | Resolves 30+ common subdomains (mail, dev, staging, cpanel, origin, etc.) |
 | Certificate Transparency | Free | Queries crt.sh for all subdomains, resolves to non-WAF IPs |
+| AlienVault OTX | Free | Passive DNS records (optional API key raises rate limits) |
+| RapidDNS | Free | Subdomain enumeration via HTML scraping |
+| HackerTarget | Free | Host search API (50 req/day) |
+| Wayback Machine | Free | Extracts hostnames from archived URLs via CDX API |
 | WAF detection | Free | Fingerprints the WAF vendor via HTTP headers |
-| Favicon hashing | Free | Generates hashes for manual Shodan/Censys favicon search |
-| ViewDNS history | API key | Historical DNS A records |
-| SecurityTrails history | API key | Historical DNS A records |
-| Censys SSL search | API key (paid) | Finds hosts presenting SSL certs matching the domain (requires paid Censys license with Org ID) |
+| Favicon hashing | Free | Generates MD5, SHA256, and MMH3 hashes for Shodan/Censys search |
+| Shodan host search | API (free tier) | Searches by SSL cert CN, hostname, and favicon hash |
+| SecurityTrails history | API (free tier) | Historical DNS A records (50 req/month free) |
+| ViewDNS history | API (paid) | Historical DNS A records |
+| Censys SSL search | API (paid) | Finds hosts presenting SSL certs matching the domain |
+| DNSDB/Farsight | API (paid) | Historical DNS records via NDJSON API |
+
+## Verification methods
+
+| Method | Weight | Description |
+|---|---|---|
+| HTML similarity | 60% | Diff-based text comparison with reference page |
+| SSL certificate | 25% | Serial number (50%), CN match (25%), SAN overlap (25%) |
+| HTTP headers | 15% | Server, X-Powered-By, and Set-Cookie name comparison |
+| Status code | ±5-20% | Bonus for match, penalty for success/error mismatch |
 
 ## Installation
 
@@ -50,13 +78,21 @@ unwaf -h
 
 ## Options
 
-    -d, --domain        The domain to check (required)
+    -d, --domain        The domain to check (required unless -l is used)
     -s, --source        The source HTML file to compare (optional)
     -c, --config        The config file path (optional, default: $HOME/.unwaf.conf)
     -t, --threshold     Similarity threshold percentage (optional, default: 60)
     -w, --workers       Number of concurrent workers (optional, default: 50)
     -v, --verbose       Enable verbose output
     -q, --quiet         Silent mode: only output bypass IPs (for piping/automation)
+    --timeout           HTTP timeout in seconds (optional, default: 10)
+    --rate-limit        Max HTTP requests per second, 0=unlimited (optional, default: 0)
+    --proxy             Proxy URL (http:// or socks5://) (optional)
+    --scan-neighbors    Scan /24 neighbors of confirmed bypass IPs (optional)
+    --json              Output results as JSON
+    -l, --list          File containing domains to check, one per line
+    -o, --output        Write results to file
+    --version           Print version and exit
     -h, --help          Display help information
 
 ## Examples
@@ -103,6 +139,36 @@ Silent mode for automation — outputs only IPs, one per line:
 unwaf -q -d example.com
 ```
 
+JSON output for automation:
+
+```sh
+unwaf -d example.com --json
+```
+
+Batch mode with domain list:
+
+```sh
+unwaf -l domains.txt --json -o results.json
+```
+
+Use a proxy (Tor, Burp, etc.):
+
+```sh
+unwaf -d example.com --proxy socks5://127.0.0.1:9050
+```
+
+Scan /24 neighbors of bypass IPs:
+
+```sh
+unwaf -d example.com --scan-neighbors
+```
+
+Rate-limit requests to 2/sec with a 5s timeout:
+
+```sh
+unwaf -d example.com --rate-limit 2 --timeout 5
+```
+
 ### Piping into other tools
 
 ```sh
@@ -114,6 +180,9 @@ unwaf -q -d target.com | httpx -silent
 
 # Batch recon
 cat domains.txt | while read d; do unwaf -q -d "$d" | sed "s/^/$d,/"; done > results.csv
+
+# JSON + jq
+unwaf -d target.com --json | jq '.bypasses[].ip'
 ```
 
 ## Configuration
@@ -122,7 +191,7 @@ On first run, Unwaf creates `$HOME/.unwaf.conf` with this template:
 
 ```ini
 # Unwaf config file — API keys for optional discovery methods
-# Free methods (SPF, MX, crt.sh, subdomains) work without any keys.
+# Free methods (SPF, MX, crt.sh, subdomains, OTX, RapidDNS, HackerTarget, Wayback) work without any keys.
 
 # ViewDNS.info — DNS history (https://viewdns.info/api/)
 viewdns=""
@@ -131,23 +200,35 @@ viewdns=""
 securitytrails=""
 
 # Censys — SSL certificate search (requires a PAID license)
-#   API access is only available with a paid Censys account that has an Organization ID.
-#   Free accounts cannot use the API — see https://docs.censys.com/reference/get-started
-#   Get your PAT from: https://app.censys.io/account/api
 censys_token=""
-#   Org ID (required) — visible in your Censys Platform URL or Settings > Organization
 censys_org_id=""
+
+# AlienVault OTX — passive DNS (optional, raises rate limits)
+otx_api_key=""
+
+# Shodan — host search by SSL cert, hostname, favicon hash
+shodan_api_key=""
+
+# DNSDB/Farsight — historical DNS records
+dnsdb_api_key=""
 ```
 
 ## How it works
 
-1. **WAF Confirmation** — Resolves the domain's current A records, checks if they fall in known WAF/CDN ranges, and fingerprints via HTTP headers. Warns if the domain doesn't appear to be behind a WAF.
-2. **Favicon Hashing** — Fetches favicon.ico and generates MD5/SHA256 hashes for external search.
-3. **IP Discovery** — Runs all enabled methods (SPF, MX, subdomains, crt.sh, DNS history, Censys) to collect candidate origin IPs.
-4. **Filtering** — Discards IPs belonging to known WAF/CDN ranges (Cloudflare, Akamai, CloudFront, Fastly, Sucuri, Imperva) and IPs that match the domain's current DNS resolution.
-5. **Port Scanning** — Checks candidates on 8 common web ports concurrently.
-6. **Origin Verification** — Fetches HTML from each web server (direct IP + Host-header injection) and compares with the reference using diff-based similarity.
-7. **Results** — Reports matches above the threshold with ready-to-use `curl` commands, or outputs bare IPs in quiet mode.
+1. **Dynamic WAF CIDRs** — Fetches live Cloudflare IP ranges and combines with hardcoded WAF/CDN ranges (including IPv6).
+2. **WAF Confirmation** — Resolves the domain's current A records, checks if they fall in known WAF/CDN ranges, and fingerprints via HTTP headers.
+3. **Favicon Hashing** — Fetches favicon.ico and generates MD5, SHA256, and MMH3 (Shodan) hashes.
+4. **IP Discovery** — Runs all enabled methods (up to 13 sources) to collect candidate origin IPs.
+5. **Filtering** — Discards IPs belonging to known WAF/CDN ranges and IPs that match the domain's current DNS resolution.
+6. **Port Scanning** — Checks candidates on 8 common web ports concurrently with progress bar.
+7. **Origin Verification** — For each web server:
+   - Fetches HTML (direct IP + Host-header injection) and compares with reference
+   - Compares SSL certificate fingerprints on TLS ports
+   - Compares HTTP response headers
+   - Calculates overall score (60% HTML + 25% cert + 15% headers ± status)
+8. **Neighbor Scanning** (optional) — Expands confirmed bypass IPs to /24 subnets and scans neighbors.
+9. **ASN Lookup** — Identifies ASN and organization for confirmed bypass IPs.
+10. **Results** — Reports matches above the threshold with scores, ASN info, and `curl` verification commands.
 
 ## Author
 
