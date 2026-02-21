@@ -234,7 +234,9 @@ dnsdb_api_key=""
 
 **Martín Martín**
 
-[My website](https://mmartin.me/) · [LinkedIn](https://www.linkedin.com/in/martinmarting/)
+- [Website](https://mmartin.me/)
+- [LinkedIn](https://www.linkedin.com/in/martinmarting/)
+- [GitHub](https://github.com/mmarting/resolvalid)
 
 ## License
 
