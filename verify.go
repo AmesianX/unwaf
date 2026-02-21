@@ -180,7 +180,11 @@ func extractCookieNames(cookies []string) map[string]bool {
 // statusCodeAdjustment returns a score adjustment based on status code comparison.
 func statusCodeAdjustment(origStatus, candStatus int) float64 {
 	if origStatus == candStatus {
-		return 0.05 // 5% boost for exact match
+		// Matching error codes is expected for generic error pages, not a positive signal
+		if origStatus >= 400 {
+			return -0.10 // 10% penalty — generic error pages match by coincidence
+		}
+		return 0.05 // 5% boost for matching success codes
 	}
 	// Penalty for error vs success mismatch
 	origIsSuccess := origStatus >= 200 && origStatus < 400

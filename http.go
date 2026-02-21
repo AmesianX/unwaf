@@ -12,8 +12,10 @@ import (
 	"strings"
 	"time"
 
+	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/charset"
+	"golang.org/x/net/http2"
 	"golang.org/x/net/proxy"
 	"golang.org/x/time/rate"
 )
@@ -23,8 +25,71 @@ var (
 	rateLimiter   *rate.Limiter
 )
 
+// browserTransport routes HTTPS through HTTP/2 (with Chrome TLS fingerprint)
+// and falls back to HTTP/1.1 when h2 is unavailable. Plain HTTP uses h1.
+type browserTransport struct {
+	h2 *http2.Transport
+	h1 *http.Transport
+}
+
+func (t *browserTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Scheme == "https" {
+		resp, err := t.h2.RoundTrip(req)
+		if err == nil {
+			return resp, nil
+		}
+		// h2 failed (server may not support it), fall back to h1
+		return t.h1.RoundTrip(req)
+	}
+	return t.h1.RoundTrip(req)
+}
+
+// utlsDialTLS returns a dial function that establishes a TCP connection and
+// performs a TLS handshake using uTLS with Chrome's fingerprint.
+// When forceH1 is true, only http/1.1 is offered in ALPN (used for h1 fallback).
+func utlsDialTLS(tcpDial func(ctx context.Context, network, addr string) (net.Conn, error), forceH1 bool) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		tcpConn, err := tcpDial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			host = addr
+		}
+
+		config := &utls.Config{
+			ServerName:         host,
+			InsecureSkipVerify: true,
+		}
+		if forceH1 {
+			config.NextProtos = []string{"http/1.1"}
+		}
+
+		tlsConn := utls.UClient(tcpConn, config, utls.HelloChrome_Auto)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			tcpConn.Close()
+			return nil, err
+		}
+
+		return tlsConn, nil
+	}
+}
+
 func newHTTPClient(timeout time.Duration, proxyURL string) *http.Client {
-	transport := &http.Transport{
+	baseDialer := &net.Dialer{
+		Timeout:   timeout,
+		KeepAlive: 30 * time.Second,
+	}
+
+	// Default TCP dial function; overridden below for SOCKS5 proxies.
+	tcpDial := baseDialer.DialContext
+	var useHTTPProxy bool
+
+	h1Transport := &http.Transport{
+		// Fallback TLS config for proxied HTTPS connections
+		// (DialTLSContext is only used for non-proxied connections).
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 10,
@@ -36,16 +101,38 @@ func newHTTPClient(timeout time.Duration, proxyURL string) *http.Client {
 		parsedURL, err := url.Parse(proxyURL)
 		if err == nil {
 			if parsedURL.Scheme == "socks5" {
-				dialer, err := proxy.FromURL(parsedURL, proxy.Direct)
+				socksDialer, err := proxy.FromURL(parsedURL, proxy.Direct)
 				if err == nil {
-					transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-						return dialer.Dial(network, addr)
+					tcpDial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+						return socksDialer.Dial(network, addr)
 					}
 				}
 			} else {
-				transport.Proxy = http.ProxyURL(parsedURL)
+				useHTTPProxy = true
+				h1Transport.Proxy = http.ProxyURL(parsedURL)
 			}
 		}
+	}
+
+	h1Transport.DialContext = tcpDial
+	h1Transport.DialTLSContext = utlsDialTLS(tcpDial, true) // h1-only ALPN for fallback
+
+	var transport http.RoundTripper
+	if useHTTPProxy {
+		// HTTP proxy: DialTLSContext only applies to non-proxied requests.
+		// Proxied HTTPS uses CONNECT tunnel + standard TLS (no utls).
+		transport = h1Transport
+	} else {
+		// Use uTLS with Chrome fingerprint for both h2 and h1.
+		// h2 is tried first (full Chrome ALPN including h2); if the server
+		// doesn't support h2, we fall back to h1 with http/1.1-only ALPN.
+		h2DialTLS := utlsDialTLS(tcpDial, false)
+		h2Transport := &http2.Transport{
+			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+				return h2DialTLS(ctx, network, addr)
+			},
+		}
+		transport = &browserTransport{h2: h2Transport, h1: h1Transport}
 	}
 
 	return &http.Client{
@@ -65,6 +152,23 @@ func waitRateLimit(ctx context.Context) error {
 		return rateLimiter.Wait(ctx)
 	}
 	return nil
+}
+
+// setBrowserHeaders sets request headers that mimic a real Chrome browser.
+// WAFs often check for Sec-Fetch-* and Sec-Ch-Ua headers to detect bots.
+func setBrowserHeaders(req *http.Request) {
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Site", "none")
+	req.Header.Set("Sec-Fetch-User", "?1")
+	req.Header.Set("Sec-Ch-Ua", `"Chromium";v="131", "Not_A Brand";v="24"`)
+	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
+	req.Header.Set("Sec-Ch-Ua-Platform", `"Windows"`)
+	req.Header.Set("Cache-Control", "max-age=0")
 }
 
 // doWithRetry executes an HTTP request with retry on 429/5xx.
@@ -125,10 +229,7 @@ func fetchHTMLWithHost(ctx context.Context, urlStr, host string) (string, int, e
 		req.Host = host
 	}
 
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Connection", "keep-alive")
+	setBrowserHeaders(req)
 
 	resp, err := doWithRetry(ctx, appHTTPClient, req, 1)
 	if err != nil {
@@ -170,10 +271,7 @@ func fetchHTMLWithHeaders(ctx context.Context, urlStr, host string) (string, int
 		req.Host = host
 	}
 
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Connection", "keep-alive")
+	setBrowserHeaders(req)
 
 	resp, err := doWithRetry(ctx, appHTTPClient, req, 1)
 	if err != nil {

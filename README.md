@@ -34,6 +34,12 @@ Unwaf is automating the steps I explained on this LinkedIn Post: [Passive WAF by
 - **More WAF signatures** — FortiWeb, Radware, Azure Front Door, Google Cloud Armor, Vercel, Netlify
 - **Dynamic step counter** — discovery steps adjust based on which API keys are configured
 - **Multi-file codebase** — split into 13 files for maintainability
+- **uTLS Chrome TLS fingerprint** — impersonates Chrome's JA3/JA4 via uTLS `HelloChrome_Auto`, bypassing WAFs that detect Go's TLS stack
+- **HTTP/2 support** — HTTPS uses `http2.Transport` (h2-first, h1 fallback); WAFs like Cloudflare reject HTTP/1.1-only TLS
+- **Browser-realistic headers** — `Sec-Fetch-*`, `Sec-Ch-Ua-*`, `Upgrade-Insecure-Requests`, `Cache-Control` to mimic Chrome
+- **WAF header detection on candidates** — discards results whose responses contain WAF headers (cf-ray, x-amz-cf-id, etc.)
+- **Smarter false-positive filtering** — header similarity forced to 0% for 4xx error responses; matching error codes penalized
+- **4xx reference warning** — warns when the reference fetch returns 4xx and suggests `--source / -s`
 
 ## Discovery methods
 

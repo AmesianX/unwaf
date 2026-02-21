@@ -13,9 +13,17 @@
 ### New verification techniques
 - **SSL certificate fingerprint matching** — compares serial number (50%), Subject CN (25%), and SAN overlap (25%) on TLS ports
 - **HTTP response header comparison** — compares Server, X-Powered-By, and Set-Cookie name headers
-- **Status code matching** — 5% boost for exact match, 20% penalty for success/error mismatch
+- **Status code matching** — 5% boost for matching success codes, 20% penalty for success/error mismatch, 10% penalty for matching error codes
 - **Overall scoring system** — 60% HTML similarity + 25% cert match + 15% header match ± status adjustment
 - **CIDR neighbor scanning** (`--scan-neighbors`) — scans /24 neighbors of confirmed bypass IPs
+- **WAF header detection on candidates** — discards candidates whose responses contain WAF-specific headers (cf-ray, x-amz-cf-id, etc.), indicating traffic is still routed through the WAF
+- **Header match suppression for error pages** — header similarity forced to 0% when candidate returns 4xx; generic error pages share headers that don't indicate origin identity
+- **4xx reference response warning** — warns when the reference HTML fetch returns 4xx and suggests `--source / -s`
+
+### Anti-bot evasion
+- **uTLS Chrome TLS fingerprint** — replaces Go's default TLS stack with uTLS `HelloChrome_Auto`, impersonating Chrome's JA3/JA4 fingerprint to bypass WAFs like Cloudflare that detect Go's TLS stack
+- **HTTP/2 support** — HTTPS requests use `http2.Transport` (h2-first with h1 fallback); Cloudflare and other WAFs reject HTTP/1.1-only TLS connections as non-browser
+- **Browser-realistic headers** — `Sec-Fetch-*`, `Sec-Ch-Ua-*`, `Upgrade-Insecure-Requests`, and `Cache-Control` headers to mimic real Chrome navigation requests
 
 ### New features
 - **MMH3 favicon hash** — computes MurmurHash3 for direct `http.favicon.hash` Shodan queries
@@ -40,7 +48,7 @@
 - **Multi-file architecture** — split monolithic main.go into 13 files (types, config, display, network, waf, http, favicon, discovery, discovery_new, verify, scan, output, progress, main)
 - **Dynamic step counter** — discovery steps automatically adjust based on configured API keys
 - **Context threading** — `ctx context.Context` threaded through all HTTP/discovery functions
-- **New dependencies** — golang.org/x/time/rate, github.com/spaolacci/murmur3, github.com/schollz/progressbar/v3
+- **New dependencies** — golang.org/x/time/rate, github.com/spaolacci/murmur3, github.com/schollz/progressbar/v3, github.com/refraction-networking/utls
 
 ---
 

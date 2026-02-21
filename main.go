@@ -306,6 +306,11 @@ func processDomain(ctx context.Context, domain string, opts *processOptions) *JS
 			}
 		}
 		logFound("Fetched reference HTML from %s (%d chars, status %d)", domain, len(originalHTML), originalStatusCode)
+		if originalStatusCode >= 400 {
+			logWarn("Reference response returned HTTP %d — the WAF may be blocking our request.", originalStatusCode)
+			logWarn("Results may be unreliable (comparing against an error page).")
+			logInfo("Consider providing the real HTML manually using --source / -s.")
+		}
 	}
 
 	// ── IP Discovery ──
@@ -509,7 +514,7 @@ func processDomain(ctx context.Context, domain string, opts *processOptions) *JS
 
 			// Method 1: Direct IP access
 			fetchedHTML, statusCode, candHeaders, fetchErr := fetchHTMLWithHeaders(ctx, urlStr, "")
-			if fetchErr == nil && statusCode < 500 {
+			if fetchErr == nil && statusCode < 500 && !responseHasWAFHeaders(candHeaders) {
 				htmlSim := compareHTML(originalHTML, fetchedHTML)
 
 				var certMatch float64
@@ -518,6 +523,11 @@ func processDomain(ctx context.Context, domain string, opts *processOptions) *JS
 				}
 
 				headerMatch := compareResponseHeaders(originalHeaders, candHeaders)
+				// Suppress header match for error responses — generic error pages
+				// return common headers that don't indicate origin identity
+				if statusCode >= 400 {
+					headerMatch = 0
+				}
 				overallScore := calculateOverallScore(htmlSim, certMatch, headerMatch, originalStatusCode, statusCode) * 100
 
 				if overallScore > opts.threshold {
@@ -541,7 +551,7 @@ func processDomain(ctx context.Context, domain string, opts *processOptions) *JS
 
 			// Method 2: Host header injection
 			fetchedHTML2, statusCode2, candHeaders2, fetchErr2 := fetchHTMLWithHeaders(ctx, urlStr, domain)
-			if fetchErr2 == nil && statusCode2 < 500 {
+			if fetchErr2 == nil && statusCode2 < 500 && !responseHasWAFHeaders(candHeaders2) {
 				htmlSim2 := compareHTML(originalHTML, fetchedHTML2)
 
 				var certMatch2 float64
@@ -550,6 +560,11 @@ func processDomain(ctx context.Context, domain string, opts *processOptions) *JS
 				}
 
 				headerMatch2 := compareResponseHeaders(originalHeaders, candHeaders2)
+				// Suppress header match for error responses — generic error pages
+				// return common headers that don't indicate origin identity
+				if statusCode2 >= 400 {
+					headerMatch2 = 0
+				}
 				overallScore2 := calculateOverallScore(htmlSim2, certMatch2, headerMatch2, originalStatusCode, statusCode2) * 100
 
 				if overallScore2 > opts.threshold {
@@ -628,7 +643,7 @@ func processDomain(ctx context.Context, domain string, opts *processOptions) *JS
 					urlStr := fmt.Sprintf("%s://%s:%d", scheme, ws.IP, port)
 
 					fetchedHTML, statusCode, candHeaders, fetchErr := fetchHTMLWithHeaders(ctx, urlStr, domain)
-					if fetchErr == nil && statusCode < 500 {
+					if fetchErr == nil && statusCode < 500 && !responseHasWAFHeaders(candHeaders) {
 						htmlSim := compareHTML(originalHTML, fetchedHTML)
 
 						var certMatch float64
@@ -637,6 +652,9 @@ func processDomain(ctx context.Context, domain string, opts *processOptions) *JS
 						}
 
 						headerMatch := compareResponseHeaders(originalHeaders, candHeaders)
+						if statusCode >= 400 {
+							headerMatch = 0
+						}
 						overallScore := calculateOverallScore(htmlSim, certMatch, headerMatch, originalStatusCode, statusCode) * 100
 
 						if overallScore > opts.threshold {

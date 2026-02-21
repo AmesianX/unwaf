@@ -67,6 +67,30 @@ var wafSignatures = map[string][]string{
 
 var wafCIDRsMu sync.Mutex
 
+// responseHasWAFHeaders returns true if the HTTP response headers contain
+// signatures of a known WAF/CDN. This indicates the response was routed
+// through the WAF, so accessing this IP is NOT a bypass.
+func responseHasWAFHeaders(headers http.Header) bool {
+	if headers == nil {
+		return false
+	}
+	for _, sigHeaders := range wafSignatures {
+		for _, h := range sigHeaders {
+			if headers.Get(h) != "" {
+				return true
+			}
+		}
+	}
+	// Also check Server header for known WAF names
+	server := strings.ToLower(headers.Get("Server"))
+	for _, name := range []string{"cloudflare", "akamaighost", "akamai", "sucuri", "incapsula", "imperva", "ddos-guard", "fortiweb", "netlify"} {
+		if strings.Contains(server, name) {
+			return true
+		}
+	}
+	return false
+}
+
 func isWAFIP(ip string) bool {
 	parsedIP := net.ParseIP(ip)
 	if parsedIP == nil {
