@@ -79,11 +79,12 @@ Discovery methods:
   [FREE]    Favicon hash fingerprinting (for manual Shodan/Censys search)
   [API]     ViewDNS IP history
   [API]     SecurityTrails DNS history
-  [API]     Censys SSL certificate search
+  [API]     Censys SSL certificate search (paid license required)
 
 Note:
   API-based methods require keys in the config file: $HOME/.unwaf.conf.
   The tool will create an example config file after first execution.
+  Censys requires a paid license with an Organization ID for API access.
 `
 
 // ---------------------------------------------------------------------------
@@ -93,10 +94,8 @@ Note:
 type Config struct {
 	ViewDNS        string `json:"viewdns"`
 	SecurityTrails string `json:"securitytrails"`
-	CensysID       string `json:"censys_id"`       // Legacy v2 (deprecated)
-	CensysSecret   string `json:"censys_secret"`   // Legacy v2 (deprecated)
-	CensysToken    string `json:"censys_token"`     // v3 Platform PAT
-	CensysOrgID    string `json:"censys_org_id"`    // v3 Platform Org ID
+	CensysToken    string `json:"censys_token"`  // Platform API PAT (paid license required)
+	CensysOrgID    string `json:"censys_org_id"` // Platform Org ID (required)
 }
 
 var apiKeyRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
@@ -244,15 +243,13 @@ viewdns=""
 # SecurityTrails — DNS history (https://securitytrails.com/corp/api)
 securitytrails=""
 
-# Censys — SSL certificate search (https://docs.censys.com/reference/get-started)
-# Option 1: New Platform API (recommended, works with all accounts)
+# Censys — SSL certificate search (requires a PAID license)
+#   API access is only available with a paid Censys account that has an Organization ID.
+#   Free accounts cannot use the API — see https://docs.censys.com/reference/get-started
 #   Get your PAT from: https://app.censys.io/account/api
 censys_token=""
-#   Org ID is optional (only needed for paid/org accounts, visible in Platform URL)
+#   Org ID (required) — visible in your Censys Platform URL or Settings > Organization
 censys_org_id=""
-# Option 2: Legacy Search API v2 (deprecated, may not work with new accounts)
-censys_id=""
-censys_secret=""
 `
 	return os.WriteFile(configPath, []byte(defaultConfig), 0600)
 }
@@ -291,10 +288,6 @@ func loadConfig(configPath string) (*Config, error) {
 			config.ViewDNS = value
 		case "securitytrails":
 			config.SecurityTrails = value
-		case "censys_id":
-			config.CensysID = value
-		case "censys_secret":
-			config.CensysSecret = value
 		case "censys_token":
 			config.CensysToken = value
 		case "censys_org_id":
@@ -831,12 +824,11 @@ func fetchIPsFromSecurityTrails(domain, apiKey string) ([]string, error) {
 // Discovery: Censys SSL certificate search
 // ---------------------------------------------------------------------------
 
-// fetchIPsFromCensysV3 uses the new Platform API (Bearer token auth)
-func fetchIPsFromCensysV3(domain, token, orgID string) ([]string, error) {
+// fetchIPsFromCensys uses the Censys Platform API v3 (Bearer token auth).
+// Requires a paid Censys license with an Organization ID.
+func fetchIPsFromCensys(domain, token, orgID string) ([]string, error) {
 	var ips []string
 
-	// Search for hosts presenting certificates matching the domain
-	// org_id is optional for free accounts, required for paid/org accounts
 	searchURL := "https://api.platform.censys.io/v3/global/search/query"
 	if orgID != "" {
 		searchURL += "?organization_id=" + orgID
@@ -866,7 +858,7 @@ func fetchIPsFromCensysV3(domain, token, orgID string) ([]string, error) {
 		body, _ := io.ReadAll(resp.Body)
 		hint := ""
 		if resp.StatusCode == 403 {
-			hint = " (ensure your user has the 'API Access' role in Censys Platform Settings > Members)"
+			hint = " (Censys API requires a paid license with an Organization ID — free accounts cannot use the API)"
 		}
 		if resp.StatusCode == 401 {
 			hint = " (check your PAT is valid at https://app.censys.io/account/api)"
@@ -908,100 +900,6 @@ func truncateStr(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "..."
-}
-
-// fetchIPsFromCensysV2 uses the legacy Search API v2 (BasicAuth, deprecated)
-func fetchIPsFromCensysV2(domain, apiID, apiSecret string) ([]string, error) {
-	var ips []string
-
-	// Step 1: Search for certificates matching the domain
-	searchURL := "https://search.censys.io/api/v2/certificates/search"
-
-	query := fmt.Sprintf("names: %s", domain)
-	bodyData := fmt.Sprintf(`{"q":"%s","per_page":100}`, query)
-
-	req, err := http.NewRequest("POST", searchURL, strings.NewReader(bodyData))
-	if err != nil {
-		return nil, err
-	}
-	req.SetBasicAuth(apiID, apiSecret)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := defaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("Censys Search API v2 returned status %d (v2 is deprecated for new accounts — use censys_token + censys_org_id instead)", resp.StatusCode)
-	}
-
-	var certResult struct {
-		Result struct {
-			Hits []struct {
-				Fingerprint string `json:"fingerprint_sha256"`
-			} `json:"hits"`
-		} `json:"result"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&certResult); err != nil {
-		return nil, err
-	}
-
-	// Step 2: For each certificate, look up which hosts present it
-	for _, hit := range certResult.Result.Hits {
-		hostsURL := fmt.Sprintf("https://search.censys.io/api/v2/certificates/%s/hosts", hit.Fingerprint)
-		hReq, err := http.NewRequest("GET", hostsURL, nil)
-		if err != nil {
-			continue
-		}
-		hReq.SetBasicAuth(apiID, apiSecret)
-
-		hResp, err := defaultClient.Do(hReq)
-		if err != nil {
-			continue
-		}
-
-		var hostResult struct {
-			Result struct {
-				Hosts []struct {
-					IP string `json:"ip"`
-				} `json:"hosts"`
-			} `json:"result"`
-		}
-
-		if err := json.NewDecoder(hResp.Body).Decode(&hostResult); err != nil {
-			hResp.Body.Close()
-			continue
-		}
-		hResp.Body.Close()
-
-		for _, host := range hostResult.Result.Hosts {
-			if !isWAFIP(host.IP) {
-				ips = append(ips, host.IP)
-			}
-		}
-	}
-
-	return ips, nil
-}
-
-// fetchIPsFromCensys tries v3 first, falls back to v2
-func fetchIPsFromCensys(domain string, config *Config) ([]string, error) {
-	// Prefer v3 Platform API (only token required, org_id optional)
-	if config.CensysToken != "" {
-		logVerbose(true, "Using Censys Platform API v3 (Bearer token)")
-		return fetchIPsFromCensysV3(domain, config.CensysToken, config.CensysOrgID)
-	}
-
-	// Fallback to legacy v2
-	if config.CensysID != "" && config.CensysSecret != "" {
-		logVerbose(true, "Using Censys Search API v2 (legacy, deprecated)")
-		return fetchIPsFromCensysV2(domain, config.CensysID, config.CensysSecret)
-	}
-
-	return nil, fmt.Errorf("no Censys credentials configured")
 }
 
 // ---------------------------------------------------------------------------
@@ -1280,14 +1178,12 @@ func processDomain(domain, source, configPath string, threshold float64, workers
 		dimWhite.Println("    Skipped — no API key. Add securitytrails=<key> to config.")
 	}
 
-	// 7. Censys
+	// 7. Censys (requires paid license)
 	if !silent {
-		boldWhite.Println("  [7/7] Censys SSL Certificate Search")
+		boldWhite.Println("  [7/7] Censys SSL Certificate Search (paid license required)")
 	}
-	hasCensysV3 := config.CensysToken != ""
-	hasCensysV2 := config.CensysID != "" && config.CensysSecret != ""
-	if hasCensysV3 || hasCensysV2 {
-		censysIPs, err := fetchIPsFromCensys(mainDomain, config)
+	if config.CensysToken != "" {
+		censysIPs, err := fetchIPsFromCensys(mainDomain, config.CensysToken, config.CensysOrgID)
 		if err != nil {
 			logWarn("Censys error: %v", err)
 		} else {
@@ -1295,8 +1191,8 @@ func processDomain(domain, source, configPath string, threshold float64, workers
 			addIPs("Censys", censysIPs)
 		}
 	} else if !silent {
-		dimWhite.Println("    Skipped — no API key. Add censys_token to config.")
-		dimWhite.Println("    Get your PAT at: https://app.censys.io/account/api")
+		dimWhite.Println("    Skipped — no API key. Add censys_token + censys_org_id to config.")
+		dimWhite.Println("    Note: Censys API requires a paid license with an Organization ID.")
 	}
 
 	// Filter and deduplicate
@@ -1470,9 +1366,8 @@ func processDomain(domain, source, configPath string, threshold float64, workers
 		logInfo("Suggestions:")
 		logInfo("  • Try lowering the threshold with -t 40")
 		logInfo("  • Provide the HTML manually with -s if the WAF blocks fetching")
-		logInfo("  • Add API keys for ViewDNS, SecurityTrails, Censys")
+		logInfo("  • Add API keys for ViewDNS, SecurityTrails, Censys (paid license)")
 		logInfo("  • Search Shodan/Censys manually with the favicon hashes above")
-		logInfo("  • Censys: get token + org ID at https://app.censys.io/account/api")
 		logInfo("  • Look for SSRF vulnerabilities to induce outbound connections")
 	}
 	if !silent {
