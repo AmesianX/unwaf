@@ -1,5 +1,5 @@
 
-# Unwaf v3.0
+# Unwaf
 
 [![Go Version](https://img.shields.io/github/go-mod/go-version/mmarting/unwaf)](https://go.dev/)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
@@ -8,40 +8,39 @@ Unwaf is a Go tool designed to help identify WAF bypasses using **passive techni
 
 Unwaf is automating the steps I explained on this LinkedIn Post: [Passive WAF bypassing](https://www.linkedin.com/posts/martinmarting_bugbounty-bugbountytips-pentesting-activity-7217385665729093632-oZEP)
 
-## What's new in v3.0
+**Current version: 3.0.0** — See [CHANGELOG.md](CHANGELOG.md) for version history.
 
-- **6 new discovery methods** — AlienVault OTX, RapidDNS, HackerTarget, Wayback Machine, Shodan, DNSDB/Farsight
-- **MMH3 favicon hashing** — computes MurmurHash3 for direct Shodan `http.favicon.hash` queries
-- **Shodan API integration** — searches by SSL cert CN, hostname, and favicon hash
-- **DNSDB/Farsight integration** — historical DNS record lookup via NDJSON API
-- **SSL certificate fingerprint matching** — compares serial numbers, CN, and SAN overlap between domain and candidate
-- **HTTP response header comparison** — compares Server, X-Powered-By, and Set-Cookie headers
-- **Status code matching** — boosts or penalizes candidates based on HTTP status code alignment
-- **Overall scoring system** — 60% HTML similarity + 25% cert match + 15% header match + status adjustment
-- **CIDR neighbor scanning** (`--scan-neighbors`) — scans /24 neighbors of confirmed bypass IPs
-- **JSON output** (`--json`) — structured JSON for automation and integration
-- **Batch mode** (`-l domains.txt`) — process multiple domains from a file
-- **File output** (`-o results.txt`) — write results to a file
-- **ASN lookup** — identifies the ASN and organization for confirmed bypass IPs
-- **Progress bars** — visual progress tracking for port scanning and verification
-- **Context/cancellation** — clean Ctrl+C handling with graceful shutdown
-- **Configurable timeout** (`--timeout`) — adjustable HTTP timeout
-- **Rate limiting** (`--rate-limit`) — control request rate to avoid bans
-- **Retry logic** — automatic retry with exponential backoff on 429/5xx
-- **Proxy support** (`--proxy`) — HTTP and SOCKS5 proxy support
-- **Dynamic Cloudflare CIDRs** — fetches live IP ranges from Cloudflare at runtime
-- **IPv6 WAF CIDRs** — Cloudflare, Akamai, Fastly, and CloudFront IPv6 ranges
-- **More WAF signatures** — FortiWeb, Radware, Azure Front Door, Google Cloud Armor, Vercel, Netlify
-- **Dynamic step counter** — discovery steps adjust based on which API keys are configured
-- **Multi-file codebase** — split into 13 files for maintainability
-- **uTLS Chrome TLS fingerprint** — impersonates Chrome's JA3/JA4 via uTLS `HelloChrome_Auto`, bypassing WAFs that detect Go's TLS stack
-- **HTTP/2 support** — HTTPS uses `http2.Transport` (h2-first, h1 fallback); WAFs like Cloudflare reject HTTP/1.1-only TLS
-- **Browser-realistic headers** — `Sec-Fetch-*`, `Sec-Ch-Ua-*`, `Upgrade-Insecure-Requests`, `Cache-Control` to mimic Chrome
-- **WAF header detection on candidates** — discards results whose responses contain WAF headers (cf-ray, x-amz-cf-id, etc.)
-- **Smarter false-positive filtering** — header similarity forced to 0% for 4xx error responses; matching error codes penalized
-- **4xx reference warning** — warns when the reference fetch returns 4xx and suggests `--source / -s`
+## Table of Contents
 
-## Discovery methods
+- [How It Works](#how-it-works)
+- [Discovery Methods](#discovery-methods)
+- [Verification Methods](#verification-methods)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Options](#options)
+- [Examples](#examples)
+- [Configuration](#configuration)
+- [Author](#author)
+- [License](#license)
+
+## How It Works
+
+1. **Dynamic WAF CIDRs** — Fetches live Cloudflare IP ranges and combines with hardcoded WAF/CDN ranges (including IPv6).
+2. **WAF Confirmation** — Resolves the domain's current A records, checks if they fall in known WAF/CDN ranges, and fingerprints via HTTP headers.
+3. **Favicon Hashing** — Fetches favicon.ico and generates MD5, SHA256, and MMH3 (Shodan) hashes.
+4. **IP Discovery** — Runs all enabled methods (up to 13 sources) to collect candidate origin IPs.
+5. **Filtering** — Discards IPs belonging to known WAF/CDN ranges and IPs that match the domain's current DNS resolution.
+6. **Port Scanning** — Checks candidates on 8 common web ports concurrently with progress bar.
+7. **Origin Verification** — For each web server:
+   - Fetches HTML (direct IP + Host-header injection) and compares with reference
+   - Compares SSL certificate fingerprints on TLS ports
+   - Compares HTTP response headers
+   - Calculates overall score (60% HTML + 25% cert + 15% headers ± status)
+8. **Neighbor Scanning** (optional) — Expands confirmed bypass IPs to /24 subnets and scans neighbors.
+9. **ASN Lookup** — Identifies ASN and organization for confirmed bypass IPs.
+10. **Results** — Reports matches above the threshold with scores, ASN info, and `curl` verification commands.
+
+## Discovery Methods
 
 | Method | Type | Description |
 |---|---|---|
@@ -61,7 +60,7 @@ Unwaf is automating the steps I explained on this LinkedIn Post: [Passive WAF by
 | Censys SSL search | API (paid) | Finds hosts presenting SSL certs matching the domain |
 | DNSDB/Farsight | API (free tier) | Historical DNS records via NDJSON API (Community Edition: 500 queries/month) |
 
-## Verification methods
+## Verification Methods
 
 | Method | Weight | Description |
 |---|---|---|
@@ -84,22 +83,24 @@ unwaf -h
 
 ## Options
 
-    -d, --domain        The domain to check (required unless -l is used)
-    -s, --source        The source HTML file to compare (optional)
-    -c, --config        The config file path (optional, default: $HOME/.unwaf.conf)
-    -t, --threshold     Similarity threshold percentage (optional, default: 60)
-    -w, --workers       Number of concurrent workers (optional, default: 50)
-    -v, --verbose       Enable verbose output
-    -q, --quiet         Silent mode: only output bypass IPs (for piping/automation)
-    --timeout           HTTP timeout in seconds (optional, default: 10)
-    --rate-limit        Max HTTP requests per second, 0=unlimited (optional, default: 0)
-    --proxy             Proxy URL (http:// or socks5://) (optional)
-    --scan-neighbors    Scan /24 neighbors of confirmed bypass IPs (optional)
-    --json              Output results as JSON
-    -l, --list          File containing domains to check, one per line
-    -o, --output        Write results to file
-    --version           Print version and exit
-    -h, --help          Display help information
+| Flag | Long Flag | Description | Default |
+|------|-----------|-------------|---------|
+| `-d` | `--domain` | The domain to check | **(required unless `-l`)** |
+| `-s` | `--source` | Source HTML file to compare | — |
+| `-c` | `--config` | Config file path | `$HOME/.unwaf.conf` |
+| `-t` | `--threshold` | Similarity threshold percentage | `60` |
+| `-w` | `--workers` | Number of concurrent workers | `50` |
+| `-v` | `--verbose` | Enable verbose output | `false` |
+| `-q` | `--quiet` | Silent mode: only output bypass IPs | `false` |
+| | `--timeout` | HTTP timeout in seconds | `10` |
+| | `--rate-limit` | Max HTTP requests per second, 0=unlimited | `0` |
+| | `--proxy` | Proxy URL (`http://` or `socks5://`) | — |
+| | `--scan-neighbors` | Scan /24 neighbors of confirmed bypass IPs | `false` |
+| | `--json` | Output results as JSON | `false` |
+| `-l` | `--list` | File containing domains to check, one per line | — |
+| `-o` | `--output` | Write results to file | — |
+| | `--version` | Print version and exit | — |
+| `-h` | `--help` | Display help information | — |
 
 ## Examples
 
@@ -219,31 +220,14 @@ shodan_api_key=""
 dnsdb_api_key=""
 ```
 
-## How it works
-
-1. **Dynamic WAF CIDRs** — Fetches live Cloudflare IP ranges and combines with hardcoded WAF/CDN ranges (including IPv6).
-2. **WAF Confirmation** — Resolves the domain's current A records, checks if they fall in known WAF/CDN ranges, and fingerprints via HTTP headers.
-3. **Favicon Hashing** — Fetches favicon.ico and generates MD5, SHA256, and MMH3 (Shodan) hashes.
-4. **IP Discovery** — Runs all enabled methods (up to 13 sources) to collect candidate origin IPs.
-5. **Filtering** — Discards IPs belonging to known WAF/CDN ranges and IPs that match the domain's current DNS resolution.
-6. **Port Scanning** — Checks candidates on 8 common web ports concurrently with progress bar.
-7. **Origin Verification** — For each web server:
-   - Fetches HTML (direct IP + Host-header injection) and compares with reference
-   - Compares SSL certificate fingerprints on TLS ports
-   - Compares HTTP response headers
-   - Calculates overall score (60% HTML + 25% cert + 15% headers ± status)
-8. **Neighbor Scanning** (optional) — Expands confirmed bypass IPs to /24 subnets and scans neighbors.
-9. **ASN Lookup** — Identifies ASN and organization for confirmed bypass IPs.
-10. **Results** — Reports matches above the threshold with scores, ASN info, and `curl` verification commands.
-
 ## Author
 
 **Martín Martín**
 
 - [Website](https://mmartin.me/)
 - [LinkedIn](https://www.linkedin.com/in/martinmarting/)
-- [GitHub](https://github.com/mmarting/resolvalid)
+- [GitHub](https://github.com/mmarting)
 
 ## License
 
-`unwaf` is distributed under GPL v3 License.
+Distributed under the [GPL v3 License](LICENSE.md).
