@@ -13,7 +13,8 @@ func createDefaultConfig(configPath string) error {
 	defaultConfig := `# Unwaf config file — API keys for optional discovery methods
 # Free methods (SPF, MX, crt.sh, subdomains, OTX, RapidDNS, HackerTarget, Wayback) work without any keys.
 
-# ViewDNS.info — DNS history (https://viewdns.info/api/)
+# ViewDNS.info — DNS history (250 free requests, no credit card required)
+#   Get your key from: https://viewdns.info/api/
 viewdns=""
 
 # SecurityTrails — DNS history (https://securitytrails.com/corp/api)
@@ -35,7 +36,7 @@ otx_api_key=""
 #   Get your key from: https://account.shodan.io/
 shodan_api_key=""
 
-# DNSDB/Farsight — historical DNS records
+# DNSDB/Farsight — historical DNS records (Community Edition: 500 queries/month free)
 #   Get your key from: https://www.farsightsecurity.com/solutions/dnsdb/
 dnsdb_api_key=""
 `

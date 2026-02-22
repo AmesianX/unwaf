@@ -55,11 +55,11 @@ Unwaf is automating the steps I explained on this LinkedIn Post: [Passive WAF by
 | Wayback Machine | Free | Extracts hostnames from archived URLs via CDX API |
 | WAF detection | Free | Fingerprints the WAF vendor via HTTP headers |
 | Favicon hashing | Free | Generates MD5, SHA256, and MMH3 hashes for Shodan/Censys search |
-| Shodan host search | API (free tier) | Searches by SSL cert CN, hostname, and favicon hash |
+| Shodan host search | API (free tier) | Searches by SSL cert CN, hostname, and favicon hash (search requires membership) |
 | SecurityTrails history | API (free tier) | Historical DNS A records (50 req/month free) |
-| ViewDNS history | API (paid) | Historical DNS A records |
+| ViewDNS history | API (free tier) | Historical DNS A records (250 free requests) |
 | Censys SSL search | API (paid) | Finds hosts presenting SSL certs matching the domain |
-| DNSDB/Farsight | API (paid) | Historical DNS records via NDJSON API |
+| DNSDB/Farsight | API (free tier) | Historical DNS records via NDJSON API (Community Edition: 500 queries/month) |
 
 ## Verification methods
 
@@ -199,7 +199,7 @@ On first run, Unwaf creates `$HOME/.unwaf.conf` with this template:
 # Unwaf config file — API keys for optional discovery methods
 # Free methods (SPF, MX, crt.sh, subdomains, OTX, RapidDNS, HackerTarget, Wayback) work without any keys.
 
-# ViewDNS.info — DNS history (https://viewdns.info/api/)
+# ViewDNS.info — DNS history (250 free requests, no credit card required)
 viewdns=""
 
 # SecurityTrails — DNS history (https://securitytrails.com/corp/api)
@@ -215,7 +215,7 @@ otx_api_key=""
 # Shodan — host search by SSL cert, hostname, favicon hash
 shodan_api_key=""
 
-# DNSDB/Farsight — historical DNS records
+# DNSDB/Farsight — historical DNS records (Community Edition: 500 queries/month free)
 dnsdb_api_key=""
 ```
 

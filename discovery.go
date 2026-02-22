@@ -446,7 +446,7 @@ func fetchIPsFromWayback(ctx context.Context, domain string, verbose bool) ([]st
 }
 
 // ---------------------------------------------------------------------------
-// Discovery: ViewDNS (API key required, paid)
+// Discovery: ViewDNS (API key required, free tier: 250 requests)
 // ---------------------------------------------------------------------------
 
 func fetchIPsFromViewDNS(ctx context.Context, domain, apiKey string) ([]string, error) {
@@ -658,7 +658,7 @@ func fetchIPsFromShodan(ctx context.Context, domain, apiKey string, mmh3Hash int
 }
 
 // ---------------------------------------------------------------------------
-// Discovery: DNSDB/Farsight (API key required, paid)
+// Discovery: DNSDB/Farsight (API key required, free Community Edition: 500 queries/month)
 // ---------------------------------------------------------------------------
 
 func fetchIPsFromDNSDB(ctx context.Context, domain, apiKey string) ([]string, error) {
