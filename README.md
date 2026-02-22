@@ -28,7 +28,7 @@ Unwaf is automating the steps I explained on this LinkedIn Post: [Passive WAF by
 1. **Dynamic WAF CIDRs** — Fetches live Cloudflare IP ranges and combines with hardcoded WAF/CDN ranges (including IPv6).
 2. **WAF Confirmation** — Resolves the domain's current A records, checks if they fall in known WAF/CDN ranges, and fingerprints via HTTP headers.
 3. **Favicon Hashing** — Fetches favicon.ico and generates MD5, SHA256, and MMH3 (Shodan) hashes.
-4. **IP Discovery** — Runs all enabled methods (up to 13 sources) to collect candidate origin IPs.
+4. **IP Discovery** — Runs all enabled methods (up to 15 sources) to collect candidate origin IPs.
 5. **Filtering** — Discards IPs belonging to known WAF/CDN ranges and IPs that match the domain's current DNS resolution.
 6. **Port Scanning** — Checks candidates on 8 common web ports concurrently with progress bar.
 7. **Origin Verification** — For each web server:
