@@ -7,8 +7,8 @@
 - **RapidDNS** — free subdomain enumeration via HTML scraping
 - **HackerTarget** — free host search API (50 req/day)
 - **Wayback Machine** — extracts unique hostnames from archived URLs via CDX API
-- **Shodan API** — searches by SSL cert CN, hostname, and favicon MMH3 hash (API key required)
-- **DNSDB/Farsight** — historical DNS record lookup via NDJSON API (API key required)
+- **Shodan API** — searches by SSL cert CN, hostname, and favicon MMH3 hash (free API key; search requires membership)
+- **DNSDB/Farsight** — historical DNS record lookup via NDJSON API (Community Edition: 500 queries/month free)
 
 ### New verification techniques
 - **SSL certificate fingerprint matching** — compares serial number (50%), Subject CN (25%), and SAN overlap (25%) on TLS ports
